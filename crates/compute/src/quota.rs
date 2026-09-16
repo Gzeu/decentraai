@@ -148,6 +148,11 @@ pub struct QuotaReservation {
     /// Whether this reservation was already settled. A settled reservation is
     /// a no-op target: settle/release on it are idempotent no-ops.
     pub settled: bool,
+    /// Consumer key that booked this reservation, when known. Old
+    /// reservations (and non-consumer paths) carry `None` — attribution is
+    /// never backfilled, only recorded for new keyed reservations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 /// The reason a quota mutation was refused.
@@ -193,6 +198,11 @@ pub struct QuotaEvent {
     /// The contribution policy version that governed the conversion (credit
     /// only; the ledger keeps it so the economics are explainable).
     pub policy_version: u32,
+    /// Consumer key behind this mutation, when known. Old events carry
+    /// `None` — history is never re-attributed, only new keyed mutations
+    /// record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 /// The deterministic quota accounting core.
@@ -215,6 +225,11 @@ pub struct QuotaLedger {
     applied: HashSet<(String, String)>,
     /// Append-only audit trail (provenance). Bounded to avoid unbounded growth.
     events: std::collections::VecDeque<QuotaEvent>,
+    /// Lifetime per-consumer-key consumption (key_id → units consumed by
+    /// settle). Old snapshots load empty and are never backfilled: only
+    /// settles of keyed reservations accumulate here.
+    #[serde(default)]
+    consumed_by_key: HashMap<String, u64>,
     /// The active contribution→quota policy.
     policy: ContributionPolicy,
     /// Set on every mutation; persistence layers use it to skip no-op writes.
@@ -289,7 +304,7 @@ impl QuotaLedger {
         let acc = self.accounts.entry(account.clone()).or_default();
         acc.earned = acc.earned.saturating_add(units);
         acc.available = acc.available.saturating_add(units);
-        self.record_event("credit", account, units, ref_id);
+        self.record_event("credit", account, units, ref_id, None);
         units
     }
 
@@ -306,6 +321,19 @@ impl QuotaLedger {
         account: &AccountId,
         reservation_id: &str,
         amount: u64,
+    ) -> Result<QuotaReservation, QuotaError> {
+        self.reserve_with_key(account, reservation_id, amount, None)
+    }
+
+    /// Books `amount` quota like [`Self::reserve`], additionally recording
+    /// which consumer key booked it so a later settle attributes consumption
+    /// per key. Unkeyed callers keep using `reserve` (key stays `None`).
+    pub fn reserve_with_key(
+        &mut self,
+        account: &AccountId,
+        reservation_id: &str,
+        amount: u64,
+        key_id: Option<String>,
     ) -> Result<QuotaReservation, QuotaError> {
         if let Some(existing) = self.reservations.get(reservation_id) {
             // Already reserved this id: return the same reservation (no-op),
@@ -326,10 +354,11 @@ impl QuotaLedger {
             account: account.clone(),
             amount,
             settled: false,
+            key_id: key_id.clone(),
         };
         self.reservations
             .insert(reservation_id.to_string(), reservation.clone());
-        self.record_event("reserve", account, amount, reservation_id);
+        self.record_event("reserve", account, amount, reservation_id, key_id.as_deref());
         Ok(reservation)
     }
 
@@ -358,6 +387,7 @@ impl QuotaLedger {
         res.settled = true;
         let account = res.account.clone();
         let amount = res.amount;
+        let key_id = res.key_id.clone();
         let used = used.min(amount);
         let released = amount.saturating_sub(used);
         let acc = self.accounts.entry(account.clone()).or_default();
@@ -365,7 +395,16 @@ impl QuotaLedger {
         acc.consumed = acc.consumed.saturating_add(used);
         // The unused remainder returns to the spendable pool.
         acc.available = acc.available.saturating_add(released);
-        self.record_event("settle", &account, used, reservation_id);
+        // Per-key attribution: only settles of keyed reservations with
+        // real consumption accumulate. Zero settles record nothing, so a
+        // key with only empty settles stays absent (no data ≠ 0).
+        if used > 0 {
+            if let Some(k) = key_id.as_deref() {
+                *self.consumed_by_key.entry(k.to_string()).or_default() =
+                    self.consumed_by_key.get(k).copied().unwrap_or(0).saturating_add(used);
+            }
+        }
+        self.record_event("settle", &account, used, reservation_id, key_id.as_deref());
         Ok(used)
     }
 
@@ -386,10 +425,11 @@ impl QuotaLedger {
         res.settled = true;
         let account = res.account.clone();
         let amount = res.amount;
+        let key_id = res.key_id.clone();
         let acc = self.accounts.entry(account.clone()).or_default();
         acc.reserved = acc.reserved.saturating_sub(amount);
         acc.available = acc.available.saturating_add(amount);
-        self.record_event("release", &account, amount, reservation_id);
+        self.record_event("release", &account, amount, reservation_id, key_id.as_deref());
         Ok(())
     }
 
@@ -398,7 +438,14 @@ impl QuotaLedger {
         self.applied.insert((op.to_string(), ref_id.to_string()))
     }
 
-    fn record_event(&mut self, op: &str, account: &AccountId, amount: u64, ref_id: &str) {
+    fn record_event(
+        &mut self,
+        op: &str,
+        account: &AccountId,
+        amount: u64,
+        ref_id: &str,
+        key_id: Option<&str>,
+    ) {
         if self.events.len() >= MAX_EVENTS {
             self.events.pop_front();
         }
@@ -408,8 +455,17 @@ impl QuotaLedger {
             amount,
             ref_id: ref_id.to_string(),
             policy_version: self.policy.version,
+            key_id: key_id.map(str::to_string),
         });
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Lifetime quota units consumed via settles of `key_id`'s reservations.
+    /// Read-only, for observability. Absent keys read as 0 — but a key with
+    /// only zero-settles (or none) is indistinguishable here from "no data";
+    /// consumers needing that distinction join with the requests counter.
+    pub fn consumed_by_key(&self, key_id: &str) -> u64 {
+        self.consumed_by_key.get(key_id).copied().unwrap_or(0)
     }
 
     /// Returns and clears the mutation flag. Persistence layers poll this to
@@ -444,6 +500,7 @@ impl QuotaLedger {
         self.reservations = other.reservations;
         self.applied = other.applied;
         self.events = other.events;
+        self.consumed_by_key = other.consumed_by_key;
         self.policy = other.policy;
     }
 }
@@ -497,6 +554,63 @@ mod tests {
             None,
             "no record for an unmeasured execution"
         );
+    }
+
+    #[test]
+    fn keyed_reservations_attribute_consumption_per_key() {
+        let mut l = ledger();
+        let acct = "peer-a".to_string();
+        l.credit(&acct, "exec-0", Some(1000), None);
+        // Keyed reservation: settle attributes to the key.
+        let res = l
+            .reserve_with_key(&acct, "res-k1", 200, Some("ck-aaa".to_string()))
+            .unwrap();
+        assert_eq!(res.key_id.as_deref(), Some("ck-aaa"));
+        l.settle(&res.reservation_id, 170).unwrap();
+        assert_eq!(l.consumed_by_key("ck-aaa"), 170);
+        assert_eq!(l.consumed_by_key("ck-unknown"), 0);
+        // Unkeyed reservation: account moves, no key attribution.
+        let res2 = l.reserve(&acct, "res-plain", 100).unwrap();
+        assert_eq!(res2.key_id, None);
+        l.settle(&res2.reservation_id, 100).unwrap();
+        assert_eq!(l.consumed_by_key("ck-aaa"), 170, "unkeyed settle changes nothing");
+        // Zero settle records nothing (absent stays absent).
+        let res3 = l
+            .reserve_with_key(&acct, "res-k2", 50, Some("ck-bbb".to_string()))
+            .unwrap();
+        l.settle(&res3.reservation_id, 0).unwrap();
+        assert_eq!(l.consumed_by_key("ck-bbb"), 0);
+        assert!(!l.consumed_by_key.contains_key("ck-bbb"));
+        // Events carry the key where known.
+        let settle_ev = l
+            .events()
+            .iter()
+            .rev()
+            .find(|e| e.op == "settle" && e.ref_id == "res-k1")
+            .unwrap();
+        assert_eq!(settle_ev.key_id.as_deref(), Some("ck-aaa"));
+    }
+
+    #[test]
+    fn old_snapshots_without_key_fields_load_clean() {
+        // Pre-key ledgers (no key_id / consumed_by_key in JSON) must load
+        // with empty attribution — history is never re-attributed.
+        let legacy = serde_json::json!({
+            "accounts": {},
+            "reservations": {},
+            "applied": [],
+            "events": [{
+                "op": "settle", "account": "a", "amount": 5,
+                "ref_id": "r", "policy_version": 1
+            }],
+            "policy": { "units_per_token": 1, "units_per_processing_ms": 1, "version": 1 }
+        });
+        let back: QuotaLedger = serde_json::from_str(&legacy.to_string()).unwrap();
+        assert_eq!(back.consumed_by_key("ck-aaa"), 0);
+        assert!(back.events().iter().all(|e| e.key_id.is_none()));
+        let mut live = ledger();
+        live.restore(back);
+        assert_eq!(live.consumed_by_key("ck-aaa"), 0);
     }
 
     #[test]

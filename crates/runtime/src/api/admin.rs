@@ -130,7 +130,7 @@ pub(crate) async fn admin_token_list_handler(
         .unwrap_or_default()
         .as_secs();
     let body = serde_json::json!({"tokens": tokens.iter().map(|t| {
-        let u = usage.get(&t.name).copied().unwrap_or((0, 0, 0));
+        let u = usage.get(&t.name).copied().unwrap_or_default();
         serde_json::json!({
             "name": &t.name,
             "tier": t.tier,
@@ -139,9 +139,11 @@ pub(crate) async fn admin_token_list_handler(
             "revoked": t.revoked,
             "expires_at": t.expires_at,
             "expired": t.expires_at.is_some_and(|ts| ts <= now),
-            "requests": u.0,
-            "tokens_generated": u.1,
-            "last_used_at": if u.2 > 0 { Some(u.2) } else { None },
+            "requests": u.requests,
+            "tokens_generated": u.measured.saturating_add(u.estimated),
+            "tokens_measured": u.measured,
+            "tokens_estimated": u.estimated,
+            "last_used_at": if u.last_used > 0 { Some(u.last_used) } else { None },
         })
     }).collect::<Vec<_>>()});
     (
@@ -402,17 +404,20 @@ pub(crate) async fn admin_consumer_key_list_handler(
         .unwrap_or_default()
         .as_secs();
     let body = serde_json::json!({"keys": keys.iter().map(|k| {
-        let u = usage.get(&k.key_id).copied().unwrap_or((0, 0, 0));
-        // Live account balance for the key's owner (authoritative ledger).
-        let (available, reserved, consumed) = ledger.as_ref().map(|l| {
+        let u = usage.get(&k.key_id).copied().unwrap_or_default();
+        // Live account balance for the key's owner (authoritative ledger),
+        // plus this key's own lifetime consumption (0/absent = no keyed
+        // settle recorded — never backfilled from the account total).
+        let (available, reserved, consumed, by_key) = ledger.as_ref().map(|l| {
             let l = l.lock().unwrap();
             let acc = l.account(&k.owner_account);
             (
                 acc.map(|a| a.available).unwrap_or(0),
                 acc.map(|a| a.reserved).unwrap_or(0),
                 acc.map(|a| a.consumed).unwrap_or(0),
+                l.consumed_by_key(&k.key_id),
             )
-        }).unwrap_or((0, 0, 0));
+        }).unwrap_or((0, 0, 0, 0));
         serde_json::json!({
             "key_id": &k.key_id,
             "prefix": &k.prefix,
@@ -422,10 +427,13 @@ pub(crate) async fn admin_consumer_key_list_handler(
             "quota_ceiling": k.quota_ceiling,
             "rate_limit_per_minute": k.rate_limit_per_minute,
             "scopes": &k.scopes,
-            "requests": u.0,
-            "tokens_generated": u.1,
-            "last_used_at": if u.2 > 0 { Some(u.2) } else { None },
+            "requests": u.requests,
+            "tokens_generated": u.measured.saturating_add(u.estimated),
+            "tokens_measured": u.measured,
+            "tokens_estimated": u.estimated,
+            "last_used_at": if u.last_used > 0 { Some(u.last_used) } else { None },
             "account_quota": { "available": available, "reserved": reserved, "consumed": consumed },
+            "quota_consumed": by_key,
             "expired_or_revoked": k.revoked,
             "age_secs": now.saturating_sub(k.created_at),
         })

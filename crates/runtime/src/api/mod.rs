@@ -116,7 +116,27 @@ fn remote_request_timeout_ms() -> u32 {
 }
 
 /// Per-token usage counters: (requests, generated tokens, last-used unix secs).
-type UsageCounters = Arc<StdMutex<HashMap<String, (u64, u64, u64)>>>;
+/// Per-key usage counters. `measured` counts tokens from engine/router
+/// usage fields; `estimated` counts fallback-derived units (SSE text scan,
+/// per-call unit stubs). Both zero with `requests > 0` means NO DATA was
+/// ever recorded — never render it as "0 tokens generated".
+#[derive(Debug, Clone, Copy, Default)]
+struct KeyUsage {
+    requests: u64,
+    measured: u64,
+    estimated: u64,
+    last_used: u64,
+}
+type UsageCounters = Arc<StdMutex<HashMap<String, KeyUsage>>>;
+
+/// Provenance of a token count: engine/router-reported (measured) or
+/// fallback-derived (estimated). Absent usage is never noted at all —
+/// callers skip `note_token_usage` instead of noting 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenSource {
+    Measured,
+    Estimated,
+}
 
 /// RAII guard for a consumer-quota reservation (Q2).
 ///
@@ -1412,28 +1432,34 @@ impl ApiState {
     /// Track token generation per auth identity. For subscribers, this also
     /// counts requests (no separate entry-point counter). For consumers,
     /// requests are counted at the `mcp_consumer_handler` entry point — this
-    /// function only adds tokens + updates timestamp.
-    fn note_token_usage(&self, auth: &Auth, generated: u64) {
+    /// function only adds tokens + updates timestamp. `source` records
+    /// whether the count is engine-reported or fallback-derived; callers
+    /// with no usage data skip this function instead of noting 0.
+    fn note_token_usage(&self, auth: &Auth, generated: u64, source: TokenSource) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         match auth {
             Auth::Subscriber { name, .. } => {
                 let mut usage = self.token_usage.lock().unwrap();
                 let entry = usage.entry(name.clone()).or_default();
-                entry.0 += 1;
-                entry.1 += generated;
-                entry.2 = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                entry.requests += 1;
+                match source {
+                    TokenSource::Measured => entry.measured += generated,
+                    TokenSource::Estimated => entry.estimated += generated,
+                }
+                entry.last_used = now;
             }
             Auth::Consumer { key_id, .. } => {
                 let mut usage = self.consumer_usage.lock().unwrap();
                 let entry = usage.entry(key_id.clone()).or_default();
-                // entry.0 (requests) is incremented at mcp_consumer_handler entry.
-                entry.1 += generated;
-                entry.2 = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                // entry.requests is incremented at mcp_consumer_handler entry.
+                match source {
+                    TokenSource::Measured => entry.measured += generated,
+                    TokenSource::Estimated => entry.estimated += generated,
+                }
+                entry.last_used = now;
             }
             _ => {}
         }
@@ -1517,7 +1543,12 @@ impl ApiState {
                 return None;
             }
             if ledger
-                .reserve(&account.to_string(), &reservation_id, amount)
+                .reserve_with_key(
+                    &account.to_string(),
+                    &reservation_id,
+                    amount,
+                    Some(key_id.to_string()),
+                )
                 .is_err()
             {
                 decentraai_audit::record_best_effort(
@@ -7847,12 +7878,16 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
         let usage = state.consumer_usage.lock().unwrap().clone();
         let ledger = state.quota_ledger.clone();
         ctx.consumer_keys = serde_json::json!({ "keys": keys.iter().map(|k| {
-            let u = usage.get(&k.key_id).copied().unwrap_or((0, 0, 0));
-            let (available, consumed) = ledger.as_ref().map(|l| {
+            let u = usage.get(&k.key_id).copied().unwrap_or_default();
+            let (available, consumed, by_key) = ledger.as_ref().map(|l| {
                 let l = l.lock().unwrap();
                 let acc = l.account(&k.owner_account);
-                (acc.map(|a| a.available).unwrap_or(0), acc.map(|a| a.consumed).unwrap_or(0))
-            }).unwrap_or((0, 0));
+                (
+                    acc.map(|a| a.available).unwrap_or(0),
+                    acc.map(|a| a.consumed).unwrap_or(0),
+                    l.consumed_by_key(&k.key_id),
+                )
+            }).unwrap_or((0, 0, 0));
             serde_json::json!({
                 "key_id": &k.key_id,
                 "prefix": &k.prefix,
@@ -7862,10 +7897,13 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 "quota_ceiling": k.quota_ceiling,
                 "rate_limit_per_minute": k.rate_limit_per_minute,
                 "scopes": &k.scopes,
-                "requests": u.0,
-                "tokens_generated": u.1,
-                "last_used_at": if u.2 > 0 { Some(u.2) } else { None },
+                "requests": u.requests,
+                "tokens_generated": u.measured.saturating_add(u.estimated),
+                "tokens_measured": u.measured,
+                "tokens_estimated": u.estimated,
+                "last_used_at": if u.last_used > 0 { Some(u.last_used) } else { None },
                 "account_quota": { "available": available, "consumed": consumed },
+                "quota_consumed": by_key,
             })
         }).collect::<Vec<_>>() });
     }
@@ -8787,8 +8825,8 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
     {
         let mut usage = state.consumer_usage.lock().unwrap();
         let entry = usage.entry(key_id.clone()).or_default();
-        entry.0 += 1; // requests
-        entry.2 = SystemTime::now()
+        entry.requests += 1;
+        entry.last_used = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
@@ -8876,7 +8914,8 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             })
         };
         guard.settle(1);
-        state.note_token_usage(auth, 1);
+        // Unit stub count, not measured tokens — always Estimated.
+        state.note_token_usage(auth, 1, TokenSource::Estimated);
         // M16 gateway outcome record (best-effort — the gate already held).
         if is_gateway {
             decentraai_audit::record_best_effort(
@@ -9055,7 +9094,8 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             serde_json::from_slice(&result_payload).unwrap_or(serde_json::Value::Null);
         if success {
             guard.settle(1);
-            state.note_token_usage(auth, 1);
+            // Unit stub count for a completed assist, not measured tokens.
+            state.note_token_usage(auth, 1, TokenSource::Estimated);
         }
         // M16 gateway outcome record (best-effort — the gate already held).
         if is_gateway {
@@ -9165,25 +9205,32 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             .unwrap_or_default();
         let payload: serde_json::Value =
             serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
-        let tokens_used = payload["executed"]["tokens_used"].as_u64().unwrap_or(0);
+        let tokens_opt = payload["executed"]["tokens_used"].as_u64();
         let ok = parts.status.is_success();
         if ok {
-            guard.settle(tokens_used);
-            state.note_token_usage(auth, tokens_used);
+            // Quota settles 0 when usage is absent (frees the reservation,
+            // consumes nothing — today's behavior, unchanged).
+            guard.settle(tokens_opt.unwrap_or(0));
+            // Tokens are noted ONLY when the router reported them. Absent
+            // usage stays absent (requests already counted at entry), so the
+            // console can render "no data" instead of a false 0.
+            if let Some(t) = tokens_opt {
+                state.note_token_usage(auth, t, TokenSource::Measured);
+            }
         }
         // M16 gateway outcome record (best-effort — the gate already held).
         if is_gateway {
             decentraai_audit::record_best_effort(
                 &state.info.repo_root.join("logs"),
                 "gateway_tool_done",
-                serde_json::json!({"key_id": key_id, "tool": "execute_decision", "ok": ok, "tokens_settled": if ok { tokens_used } else { 0 }}),
+                serde_json::json!({"key_id": key_id, "tool": "execute_decision", "ok": ok, "tokens_settled": if ok { tokens_opt.unwrap_or(0) } else { 0 }}),
             );
         }
         // On failure the guard's Drop releases the reservation (no leak).
         ctx.execution = serde_json::json!({
             "status": parts.status.as_u16(),
             "ok": ok,
-            "quota": { "reserved": true, "settled": ok, "tokens_settled": if ok { tokens_used } else { 0 } },
+            "quota": { "reserved": true, "settled": ok, "tokens_settled": if ok { tokens_opt.unwrap_or(0) } else { 0 } },
             "body": payload,
         });
     } else if let Some(args) = crate::mcp::arena_act_request(&raw) {
@@ -17475,7 +17522,8 @@ fn stream_inference(
                 state
                     .tokens_generated
                     .fetch_add(completion, Ordering::SeqCst);
-                state.note_token_usage(&auth, completion);
+                // Counted from SSE text, not an engine usage field.
+                state.note_token_usage(&auth, completion, TokenSource::Estimated);
                 if let Some(cm) = &state.compute {
                     let req_id = format!("chat-stream-{}", uuid::Uuid::new_v4());
                     let local_peer = cm.local_peer();
@@ -18196,7 +18244,12 @@ async fn proxy_with_auth(
                 let completion = generated["usage"]["completion_tokens"]
                     .as_u64()
                     .unwrap_or(0);
-                state.note_token_usage(&auth, completion);
+                // Engine-reported usage only. Absent usage stays absent
+                // (requests already counted); the console renders "no data",
+                // never a false 0. Quota settle below keeps today's behavior.
+                if generated["usage"]["completion_tokens"].as_u64().is_some() {
+                    state.note_token_usage(&auth, completion, TokenSource::Measured);
+                }
                 if let Some(cm) = &state.compute {
                     let prompt_tokens = generated["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
                     let total_tokens = prompt_tokens + completion;
@@ -18459,7 +18512,8 @@ async fn route_remote_chat(
                 prompt_tokens, resp.tokens_used
             );
             state.record_inference(&path, started.elapsed(), usage_json.as_bytes());
-            state.note_token_usage(&auth, resp.tokens_used.into());
+            // Typed router response: the count is present by construction.
+            state.note_token_usage(&auth, resp.tokens_used.into(), TokenSource::Measured);
             // Chat history (USER DATA): the reply is fully buffered here.
             let conv_id = chat_capture.as_ref().and_then(|capture| {
                 if resp.output.is_empty() {
