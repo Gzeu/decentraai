@@ -367,6 +367,10 @@ pub struct ComputeManager {
     /// contribution state. When set, every recorded execution persists the
     /// lifetime/per-model/per-worker projections atomically.
     contribution_path: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Optional JSON snapshot path (`db/compensation.json`) for the M9-9
+    /// reputation-compensation ledger. When set, every compensation credit
+    /// persists the ledger atomically so earnings survive restarts.
+    compensation_path: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// Bounded, newest-first full autonomous execution decisions (M23 Full
     /// Autonomy): candidates, constraints, score, selected worker, KV affinity,
     /// engine capability, expected mode, fallback and lifecycle trace — the
@@ -452,6 +456,7 @@ impl ComputeManager {
             executions_path: std::sync::Mutex::new(None),
             credits_path: std::sync::Mutex::new(None),
             contribution_path: std::sync::Mutex::new(None),
+            compensation_path: std::sync::Mutex::new(None),
             recent_decisions: std::sync::Mutex::new(VecDeque::new()),
             signing_key: None,
             breaker: std::sync::Mutex::new(crate::breaker::CircuitBreaker::new(
@@ -553,6 +558,38 @@ impl ComputeManager {
         *slot = path.clone();
         if let Some(p) = &path {
             self.replay_contribution(p);
+        }
+    }
+
+    /// Enables persistent compensation-ledger snapshots (M9-9). `path` is
+    /// the JSON file (`db/compensation.json`); on set, any existing snapshot
+    /// is loaded into the ledger so earnings survive restarts.
+    pub fn set_compensation_path(&self, path: Option<std::path::PathBuf>) {
+        let mut slot = self.compensation_path.lock().unwrap();
+        *slot = path.clone();
+        if let Some(p) = &path {
+            self.replay_compensation(p);
+        }
+    }
+
+    /// Loads `db/compensation.json` into the compensation ledger
+    /// (best-effort; a missing or corrupt file only logs).
+    fn replay_compensation(&self, path: &std::path::Path) {
+        if let Some(ledger) = decentraai_compute::CompensationLedger::load_snapshot(path) {
+            *self.compensation.lock().unwrap() = ledger;
+        }
+    }
+
+    /// Persists the compensation ledger snapshot atomically.
+    /// Best-effort: a write failure never breaks the accounting flow.
+    /// `pub` so the M18 settle path (which credits outside this manager's
+    /// methods) can persist through the same door.
+    pub fn persist_compensation(&self) {
+        let path = self.compensation_path.lock().unwrap().clone();
+        let Some(path) = path else { return };
+        let ledger = self.compensation.lock().unwrap();
+        if let Err(e) = ledger.save_atomic(&path) {
+            tracing::warn!(error = %e, path = %path.display(), "failed to persist compensation ledger");
         }
     }
 
@@ -796,6 +833,8 @@ impl ComputeManager {
                 let worker_account = peer.to_string();
                 let mut c = self.compensation.lock().unwrap();
                 c.credit(&worker_account, request_id, &profile);
+                drop(c);
+                self.persist_compensation();
             }
         }
         // P14: credit the new receipt-backed credit ledger with the same real
@@ -3382,6 +3421,41 @@ mod tests {
             1,
             "replayed execution must not be re-recorded in the state"
         );
+    }
+
+    #[test]
+    fn compensation_ledger_persists_across_restart() {
+        // Measured Q4 gap: get_compensation read 0 after every restart while
+        // the sibling ledgers survived — the compensation ledger had no
+        // snapshot path wired at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db/compensation.json");
+        let manager = ComputeManager::new(peer(), "c".into(), HashSet::new());
+        manager.set_compensation_path(Some(path.clone()));
+        let profile = decentraai_compute::ContributionProfile {
+            cpu_cores: 4,
+            ram_mb: 8192,
+            vram_mb: 0,
+            online_seconds: 3600,
+            verified_requests: 1,
+            failed_requests: 0,
+        };
+        let earned = {
+            let ledger = manager.compensation_ledger();
+            let mut l = ledger.lock().unwrap();
+            l.credit("worker-a", "exec-comp", &profile)
+        };
+        assert!(earned > 0, "healthy profile must earn compensation");
+        manager.persist_compensation();
+        assert!(path.exists(), "snapshot file must exist after persist");
+        // A new manager over the same file recovers earnings + idempotency.
+        let restarted = ComputeManager::new(peer(), "c".into(), HashSet::new());
+        restarted.set_compensation_path(Some(path.clone()));
+        let acc = restarted
+            .compensation_account("worker-a")
+            .expect("account must survive restart");
+        assert_eq!(acc.earned, earned);
+        assert_eq!(restarted.compensation_events().len(), 1);
     }
 
     #[tokio::test]

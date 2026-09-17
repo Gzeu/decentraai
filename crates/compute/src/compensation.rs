@@ -174,7 +174,10 @@ pub struct CompensationEvent {
 ///
 /// Wrap this behind a `Mutex` (never `await` under the lock). All operations
 /// are pure, idempotent by `ref_id`, and audited — mirroring `QuotaLedger`.
-#[derive(Debug, Default)]
+/// The ledger persists to `db/compensation.json` (atomic snapshot + replay
+/// on attach); without it every restart silently zeroed `get_compensation`
+/// while the other ledgers survived.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CompensationLedger {
     /// Per-account balances.
     accounts: std::collections::HashMap<String, CompensationAccount>,
@@ -259,6 +262,65 @@ impl CompensationLedger {
             failed_requests: profile.failed_requests,
         });
         amount
+    }
+
+    /// Writes a crash-safe snapshot (tmp file + rename) of the whole ledger.
+    pub fn save_atomic(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Loads a previously saved snapshot; `None` when absent or corrupt
+    /// (callers then start from a fresh ledger — never fail the node for it).
+    pub fn load_snapshot(path: &std::path::Path) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        serde_json::from_slice(bytes.as_slice()).ok()
+    }
+
+    /// Adopts another ledger's balances/history wholesale (used at boot to
+    /// restore a saved snapshot into the live instance).
+    pub fn restore(&mut self, other: CompensationLedger) {
+        self.accounts = other.accounts;
+        self.applied = other.applied;
+        self.events = other.events;
+        self.policy = other.policy;
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_round_trip_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compensation.json");
+        let mut ledger = CompensationLedger::new(RewardPolicy::default());
+        let profile = ContributionProfile {
+            cpu_cores: 4,
+            ram_mb: 8192,
+            vram_mb: 0,
+            online_seconds: 3600,
+            verified_requests: 1,
+            failed_requests: 0,
+        };
+        let credited = ledger.credit("worker-a", "exec-1", &profile);
+        assert!(credited > 0, "healthy profile must earn");
+        ledger.save_atomic(&path).unwrap();
+        let back = CompensationLedger::load_snapshot(&path).unwrap();
+        assert_eq!(back.account("worker-a").unwrap().earned, credited);
+        assert_eq!(back.events().len(), 1);
+        let mut live = CompensationLedger::new(RewardPolicy::default());
+        live.restore(back);
+        assert_eq!(live.account("worker-a").unwrap().earned, credited);
+        // Idempotency key survives the trip: no double-pay after restore.
+        assert_eq!(live.credit("worker-a", "exec-1", &profile), 0);
     }
 }
 

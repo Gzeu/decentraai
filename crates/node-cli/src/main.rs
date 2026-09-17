@@ -2024,6 +2024,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     compute_manager.set_executions_path(Some(data_dir.join("db/executions.jsonl")));
     compute_manager.set_credits_path(Some(data_dir.join("db/credits.json")));
     compute_manager.set_contribution_path(Some(data_dir.join("db/contribution.json")));
+    // M9-9 compensation ledger (db/compensation.json) — without this wiring
+    // every restart silently zeroed get_compensation while the sibling
+    // ledgers survived (measured Q4: revenue full, compensation empty).
+    compute_manager.set_compensation_path(Some(data_dir.join("db/compensation.json")));
 
     // ---- Collective Intelligence P1: this node's logical agents ----
     // Agents are logical execution contexts hosted by the node (NOT extra
@@ -8724,6 +8728,9 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // HOT state in memory, HISTORY on disk).
     compute_manager.set_credits_path(Some(data_dir.join("db/credits.json")));
     compute_manager.set_contribution_path(Some(data_dir.join("db/contribution.json")));
+    // M9-9 compensation ledger (db/compensation.json) — same restart
+    // survival as the sibling ledgers (measured Q4 gap).
+    compute_manager.set_compensation_path(Some(data_dir.join("db/compensation.json")));
     // Coordinator-side policy: when the node permits on-demand provisioning,
     // the scheduler may route workloads to workers that will fetch the model
     // instead of only to workers that already serve it (M14).

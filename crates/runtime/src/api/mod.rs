@@ -8424,6 +8424,8 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                                                 "compensation credited on escrow settle"
                                             );
                                         }
+                                        drop(ledger);
+                                        cm.persist_compensation();
                                     }
                                 }
                                 serde_json::to_value(&r).unwrap()
