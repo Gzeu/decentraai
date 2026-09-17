@@ -434,6 +434,7 @@ pub(crate) async fn admin_consumer_key_list_handler(
             "last_used_at": if u.last_used > 0 { Some(u.last_used) } else { None },
             "account_quota": { "available": available, "reserved": reserved, "consumed": consumed },
             "quota_consumed": by_key,
+            "quota_expires_at": k.quota_expires_at,
             "expired_or_revoked": k.revoked,
             "age_secs": now.saturating_sub(k.created_at),
         })

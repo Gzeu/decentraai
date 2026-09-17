@@ -9558,7 +9558,9 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             )
                 .into_response();
         }
-        let request_id = format!("cr-{}-{:?}", &uuid::Uuid::new_v4().to_string()[..12], std::time::Instant::now());
+        // Receipt id: uuid only. (A previous revision leaked a Rust
+        // `Instant` Debug dump into the id — stable opaque ids only.)
+        let request_id = format!("cr-{}", &uuid::Uuid::new_v4().to_string()[..12]);
         let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
         {
             Ok(g) => g,
@@ -9620,6 +9622,12 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         // from the same ledger snapshot so the two must agree. `tokens`
         // is the headline total; in/out split follows for chat/embeddings
         // (0/0 for ocr/pages and for unmeasured results).
+        // On failure the guard is dropped FIRST so the held reservation is
+        // released before the read — otherwise `balance_after` would show
+        // mid-hold state instead of the settled outcome.
+        if !success {
+            drop(guard);
+        }
         let (balance_after, consumed_after) = state
             .quota_ledger
             .as_ref()
