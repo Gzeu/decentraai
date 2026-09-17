@@ -9883,7 +9883,12 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             // The quota object mirrors the ledger outcome, not the attempt:
             // failure settles zero (never merely releases), so `settled` is
             // true and `reserved` false on both paths — matching the events.
-            "quota": {"reserved": false, "settled": true, "tokens_settled": if success {billed} else {0}},
+            // `tokens_settled` counts TOKENS settled (in+out), matching the
+            // execute_decision path — money lives only in
+            // `receipt.micro_cu_billed`. (A revision briefly carried the
+            // billed CU here under the legacy name; fixed before any
+            // predicate could lock onto it.)
+            "quota": {"reserved": false, "settled": true, "tokens_settled": if success {tokens_in.saturating_add(tokens_out)} else {0}},
             "receipt": compute_receipt(
                 request_id,
                 &capability,
