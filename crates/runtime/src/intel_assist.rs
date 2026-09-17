@@ -103,6 +103,29 @@ impl AssistWorkerState {
     }
 }
 
+/// Best-effort reachability probe for a configured HTTP backend URL.
+/// Bounded 100 ms TCP connect (host:port parsed from the URL); anything
+/// unparseable or unreachable reads as down. Pure guard for offer
+/// decisions — never used to assert health, only to decline work we
+/// cannot serve.
+fn embeddings_backend_reachable(url: &str) -> bool {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host_port = without_scheme.split('/').next().unwrap_or_default();
+    let addr = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    };
+    use std::net::ToSocketAddrs;
+    let Ok(mut addrs) = addr.to_socket_addrs() else {
+        return false;
+    };
+    let Some(sock) = addrs.next() else {
+        return false;
+    };
+    std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(100)).is_ok()
+}
+
 /// Builds the DFCP dispatch callback for a WORKER node. Returns `Some(bytes)`
 /// as the synchronous reply for Reserve/Assign; `None` for notifications.
 #[allow(clippy::too_many_arguments)]
@@ -116,6 +139,27 @@ pub fn attach_dfcp_worker(
             // Capacity poll: answer with an owner-limit-checked OFFER only when
             // we can genuinely help. An empty reply means "not a candidate".
             DfcInbound::Request(request) => {
+                // Liveness pre-flight: never offer embeddings while the
+                // configured embeddings backend is unreachable — offering
+                // work we cannot do wastes the requester's lease and time,
+                // failing minutes later at execution. Bounded 100 ms TCP
+                // check, embeddings-only, only when a dedicated URL is
+                // configured (cold path: polls arrive per assist need, not
+                // per gossip tick — never on a hot loop).
+                if request.capability == "embeddings"
+                    && let Some(url) = state
+                        .embeddings_backend_url
+                        .as_ref()
+                        .map(|u| u.read().expect("embeddings url lock").clone())
+                    && !embeddings_backend_reachable(&url)
+                {
+                    tracing::info!(
+                        capability = %request.capability,
+                        url = %url,
+                        "declining embeddings offer: backend unreachable (refusal logged server-side; wire stays empty-decline per DFCP)"
+                    );
+                    return None;
+                }
                 let trusted = true; // private swarm + admission gate upstream
                 if let Some((cpu, ram)) = state.limits.admit(
                     &request.capability,
@@ -713,4 +757,29 @@ fn read_loadavg() -> String {
         .ok()
         .and_then(|s| s.split_whitespace().next().map(str::to_string))
         .unwrap_or_else(|| "0.00".to_string())
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_backend_reads_down() {
+        // Nothing listens on this port (high, odd, loopback).
+        assert!(!embeddings_backend_reachable("http://127.0.0.1:8477"));
+    }
+
+    #[test]
+    fn listening_socket_reads_up() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(embeddings_backend_reachable(&format!("http://127.0.0.1:{port}")));
+        drop(listener);
+    }
+
+    #[test]
+    fn garbage_url_reads_down() {
+        assert!(!embeddings_backend_reachable("not a url at all [[["));
+        assert!(!embeddings_backend_reachable(""));
+    }
 }

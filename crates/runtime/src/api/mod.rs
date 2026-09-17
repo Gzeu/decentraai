@@ -6384,6 +6384,57 @@ fn merge_peer_views(
     )
 }
 
+/// Builds a compute-assist receipt with ONE shape on every path
+/// (consumer/operator × live/dry_run × success/failure). Uniform keys by
+/// construction — no path can silently diverge again:
+/// `{request_id, capability, model, tokens, tokens_in, tokens_out, pages,
+/// latency_ms, micro_cu_billed, balance_after, quota_consumed, account,
+/// dry_run, rate_card_version, rate_card}`. `account` is the billed quota
+/// account, or null where no account exists (operator paths, dry runs
+/// without one); `dry_run` is always present (false on live calls).
+#[allow(clippy::too_many_arguments)]
+fn compute_receipt(
+    request_id: String,
+    capability: &str,
+    model: String,
+    tokens_in: u64,
+    tokens_out: u64,
+    pages: u64,
+    latency_ms: u64,
+    billed: u64,
+    balance_after: u64,
+    quota_consumed: u64,
+    account: Option<&str>,
+    dry_run: bool,
+) -> serde_json::Value {
+    let card = decentraai_compute::RateCard::v1();
+    serde_json::json!({
+        "request_id": request_id,
+        "capability": capability,
+        "model": model,
+        "tokens": tokens_in.saturating_add(tokens_out),
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "pages": pages,
+        "latency_ms": latency_ms,
+        "micro_cu_billed": billed,
+        "balance_after": balance_after,
+        "quota_consumed": quota_consumed,
+        "account": account,
+        "dry_run": dry_run,
+        "rate_card_version": decentraai_compute::RATE_CARD_VERSION,
+        "rate_card": {
+            "version": card.version,
+            "rounding": "ceil",
+            "unit": "micro_cu",
+            "embeddings_per_1k_in": card.embeddings_per_1k_in,
+            "chat_per_500_out": card.chat_per_500_out,
+            "chat_per_2k_in": card.chat_per_2k_in,
+            "ocr_per_page": card.ocr_per_page,
+        },
+    })
+}
+
 fn extract_tool_name(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     if v.get("method")?.as_str()? == "tools/call" {
@@ -8175,6 +8226,8 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                     .max(decentraai_compute::bill(&card, &capability, 0, 0, est_pages));
             let request_id =
                 format!("cr-{}", &uuid::Uuid::new_v4().to_string()[..12]);
+            // Operator holds no quota account: balance fields read 0 with
+            // an explicit null account (never a value that looks funded).
             ctx.compute_result = serde_json::json!({
                 "status": 200,
                 "ok": true,
@@ -8182,30 +8235,20 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 "capability": capability,
                 "explanation": "dry run: estimate only, nothing reserved or consumed",
                 "quota": {"reserved": false, "settled": false, "tokens_settled": 0},
-                "receipt": {
-                    "request_id": request_id,
-                    "capability": capability,
-                    "model": "",
-                    "tokens": 0,
-                    "tokens_in": 0,
-                    "tokens_out": 0,
-                    "pages": est_pages,
-                    "latency_ms": 0,
-                    "micro_cu_billed": estimate,
-                    "balance_after": 0,
-                    "quota_consumed": 0,
-                    "dry_run": true,
-                    "rate_card_version": decentraai_compute::RATE_CARD_VERSION,
-                    "rate_card": {
-                        "version": card.version,
-                        "rounding": "ceil",
-                        "unit": "micro_cu",
-                        "embeddings_per_1k_in": card.embeddings_per_1k_in,
-                        "chat_per_500_out": card.chat_per_500_out,
-                        "chat_per_2k_in": card.chat_per_2k_in,
-                        "ocr_per_page": card.ocr_per_page,
-                    },
-                },
+                "receipt": compute_receipt(
+                    request_id,
+                    &capability,
+                    String::new(),
+                    0,
+                    0,
+                    est_pages,
+                    0,
+                    estimate,
+                    0,
+                    0,
+                    None,
+                    true,
+                ),
                 "body": serde_json::Value::Null,
             });
         } else {
@@ -8216,6 +8259,7 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                     serde_json::json!({"error": "no connected workers for compute assist"})
                 } else {
                     let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                    let started = std::time::Instant::now();
                     let (success, result_payload, explanation) =
                         crate::intel_assist::run_assist_request(
                             p2p,
@@ -8229,16 +8273,37 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                             lease_secs,
                         )
                         .await;
+                    let latency_ms = started.elapsed().as_millis() as u64;
                     let result_json: serde_json::Value =
                         serde_json::from_slice(&result_payload)
                             .unwrap_or(serde_json::Value::Null);
-                    serde_json::json!({
+                    // Uniform receipt on failure too (operator holds no
+                    // quota: billed 0, balances 0, account null — the shape
+                    // matches the consumer failure receipt key for key).
+                    let mut obj = serde_json::json!({
                         "status": if success { 200 } else { 502 },
                         "ok": success,
                         "capability": capability,
                         "explanation": explanation,
                         "body": result_json,
-                    })
+                    });
+                    if !success {
+                        obj["receipt"] = compute_receipt(
+                            format!("cr-{}", &uuid::Uuid::new_v4().to_string()[..12]),
+                            &capability,
+                            String::new(),
+                            0,
+                            0,
+                            0,
+                            latency_ms,
+                            0,
+                            0,
+                            0,
+                            None,
+                            false,
+                        );
+                    }
+                    obj
                 }
             }
             None => serde_json::json!({"error": "p2p not attached for compute assist"}),
@@ -9621,30 +9686,20 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 "capability": capability,
                 "explanation": "dry run: estimate only, nothing reserved or consumed",
                 "quota": {"reserved": false, "settled": false, "tokens_settled": 0},
-                "receipt": {
-                    "request_id": format!("cr-{}", &uuid::Uuid::new_v4().to_string()[..12]),
-                    "capability": capability,
-                    "model": "",
-                    "tokens": 0,
-                    "tokens_in": 0,
-                    "tokens_out": 0,
-                    "pages": est_pages,
-                    "latency_ms": 0,
-                    "micro_cu_billed": estimate,
-                    "balance_after": available,
-                    "quota_consumed": 0,
-                    "dry_run": true,
-                    "rate_card_version": decentraai_compute::RATE_CARD_VERSION,
-                    "rate_card": {
-                        "version": card.version,
-                        "rounding": "ceil",
-                        "unit": "micro_cu",
-                        "embeddings_per_1k_in": card.embeddings_per_1k_in,
-                        "chat_per_500_out": card.chat_per_500_out,
-                        "chat_per_2k_in": card.chat_per_2k_in,
-                        "ocr_per_page": card.ocr_per_page,
-                    },
-                },
+                "receipt": compute_receipt(
+                    format!("cr-{}", &uuid::Uuid::new_v4().to_string()[..12]),
+                    &capability,
+                    String::new(),
+                    0,
+                    0,
+                    est_pages,
+                    0,
+                    estimate,
+                    available,
+                    0,
+                    Some(account),
+                    true,
+                ),
                 "body": serde_json::Value::Null,
             });
             return (
@@ -9829,29 +9884,20 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             // failure settles zero (never merely releases), so `settled` is
             // true and `reserved` false on both paths — matching the events.
             "quota": {"reserved": false, "settled": true, "tokens_settled": if success {billed} else {0}},
-            "receipt": {
-                "request_id": request_id,
-                "capability": capability,
-                "model": model,
-                "tokens": tokens_in.saturating_add(tokens_out),
-                "tokens_in": tokens_in,
-                "tokens_out": tokens_out,
-                "pages": pages,
-                "latency_ms": latency_ms,
-                "micro_cu_billed": billed,
-                "balance_after": balance_after,
-                "quota_consumed": consumed_after,
-                "rate_card_version": decentraai_compute::RATE_CARD_VERSION,
-                "rate_card": {
-                    "version": card.version,
-                    "rounding": "ceil",
-                    "unit": "micro_cu",
-                    "embeddings_per_1k_in": card.embeddings_per_1k_in,
-                    "chat_per_500_out": card.chat_per_500_out,
-                    "chat_per_2k_in": card.chat_per_2k_in,
-                    "ocr_per_page": card.ocr_per_page,
-                },
-            },
+            "receipt": compute_receipt(
+                request_id,
+                &capability,
+                model,
+                tokens_in,
+                tokens_out,
+                pages,
+                latency_ms,
+                billed,
+                balance_after,
+                consumed_after,
+                Some(account),
+                false,
+            ),
             "body": result_json,
         });
         let id = serde_json::from_str::<serde_json::Value>(&raw)
