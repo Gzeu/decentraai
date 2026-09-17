@@ -5992,9 +5992,92 @@ fn anchor_is_sim_linked(
         .is_some_and(|c| c.sim)
 }
 
+/// Executes a payout redemption atomically across the three ledgers:
+/// compensation (`redeemed +=`, `earned` untouched), quota (`available` →
+/// `consumed` on the destination account), and the M18 payout record.
+/// Validation (amount, destination, network, redeemable, quota cover)
+/// happens BEFORE any mutation; every mutation thereafter is infallible
+/// (saturating), so a failure can never half-apply. Locks nest in the
+/// fixed order compensation → quota → payouts, briefly, with no await or
+/// I/O inside (no other path nests these the other way around).
+/// Returns the payout record JSON on success, or a §1.4 typed error.
+#[allow(clippy::too_many_arguments)]
+fn execute_payout(
+    m18: &crate::m18::M18State,
+    comp: &std::sync::Arc<std::sync::Mutex<decentraai_compute::CompensationLedger>>,
+    quota: &std::sync::Arc<std::sync::Mutex<decentraai_compute::QuotaLedger>>,
+    amount: u64,
+    destination: &str,
+    network: &str,
+    caller_key_id: Option<&str>,
+    now: u64,
+) -> Result<serde_json::Value, serde_json::Value> {
+    use decentraai_economy::payout as po;
+    if amount < po::MIN_PAYOUT_MICRO_CU {
+        return Err(invalid_request(
+            po::PayoutError::BelowMinimum(po::MIN_PAYOUT_MICRO_CU).to_string(),
+        ));
+    }
+    if let Err(e) = po::validate_destination(destination) {
+        return Err(invalid_request(e.to_string()));
+    }
+    if let Err(e) = po::validate_network(network) {
+        return Err(invalid_request(e.to_string()));
+    }
+    let payout_id = format!("po-{}", &uuid::Uuid::new_v4().to_string()[..12]);
+    // Balance checks AND mutations happen under both locks held together,
+    // so no interleaving payout can slip between check and apply. Any
+    // failure aborts before the payout record is inserted: no partial
+    // payout can exist. (No other path nests these two locks, and there
+    // is no await or I/O inside.)
+    {
+        let mut comp = comp.lock().unwrap();
+        let mut quota = quota.lock().unwrap();
+        if comp.redeemable(destination) < amount {
+            return Err(invalid_request(format!(
+                "insufficient_balance: redeemable {} < {amount}",
+                comp.redeemable(destination)
+            )));
+        }
+        let available = quota
+            .account(&destination.to_string())
+            .map(|a| a.available)
+            .unwrap_or(0);
+        if available < amount {
+            return Err(invalid_request(format!(
+                "insufficient_balance: quota available {available} < {amount}"
+            )));
+        }
+        // redeem() already prefixes its own stable token.
+        comp.redeem(destination, amount, &payout_id)
+            .map_err(|e| invalid_request(e.to_string()))?;
+        // QuotaError speaks of "quota"; normalize to the payout vocabulary.
+        quota
+            .payout_consume(&destination.to_string(), amount, &payout_id, caller_key_id)
+            .map_err(|e| invalid_request(format!("insufficient_balance: quota leg: {e}")))?;
+    }
+    let record = po::PayoutRecord {
+        payout_id: payout_id.clone(),
+        amount_micro_cu: amount,
+        destination: destination.to_string(),
+        network: network.to_string(),
+        tx_hash: String::new(),
+        settlement: "ledger".to_string(),
+        status: po::PayoutStatus::Sent,
+        redeemed_from: destination.to_string(),
+        created_at: now,
+    };
+    {
+        let mut payouts = m18.payouts.lock().unwrap();
+        payouts.records.insert(payout_id, record.clone());
+    }
+    let _ = m18.save_payouts();
+    Ok(serde_json::to_value(&record).unwrap_or(serde_json::json!({})))
+}
+
 /// §1.4 error contract for policy refusals: a stable machine-readable
 /// shape `{error: {message, type: "invalid_request"}}`. Only NEW refusals
-/// (sybil guards) use it; every legacy error surface stays byte-identical.
+/// use it; every legacy error surface stays byte-identical.
 fn invalid_request(msg: impl Into<String>) -> serde_json::Value {
     serde_json::json!({"error": {"message": msg.into(), "type": "invalid_request"}})
 }
@@ -6327,6 +6410,8 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                         serde_json::json!({
                             "account": account,
                             "earned": acc.earned,
+                            "redeemed": acc.redeemed,
+                            "redeemable": acc.earned.saturating_sub(acc.redeemed),
                         })
                     })
                     .collect();
@@ -6350,6 +6435,7 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 serde_json::json!({
                     "accounts": accounts,
                     "total_earned": accounts.iter().map(|a| a["earned"].as_u64().unwrap_or(0)).sum::<u64>(),
+                    "total_redeemed": accounts.iter().map(|a| a["redeemed"].as_u64().unwrap_or(0)).sum::<u64>(),
                     "recent_events": events,
                     "policy": {
                         "tokens_per_verified_request": policy.tokens_per_verified_request,
@@ -8432,6 +8518,33 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                             }
                             Err(e) => serde_json::json!({"error": e.to_string()}),
                         }
+                    }
+                }
+                "m18_request_payout" => {
+                    let amount = args.get("amount_micro_cu").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let destination = args
+                        .get("destination")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let network = args.get("network").and_then(|v| v.as_str()).unwrap_or("");
+                    match (&state.compute, &state.quota_ledger) {
+                        (Some(cm), Some(quota)) => match execute_payout(
+                            m18,
+                            &cm.compensation_ledger(),
+                            quota,
+                            amount,
+                            destination,
+                            network,
+                            None,
+                            now,
+                        ) {
+                            Ok(record) => {
+                                cm.persist_compensation();
+                                record
+                            }
+                            Err(e) => e,
+                        },
+                        _ => serde_json::json!({"error": "compute or quota ledger not attached"}),
                     }
                 }
                 "m18_record_trust" => {
@@ -11225,6 +11338,52 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 "count": 0,
             }),
         };
+    } else if crate::mcp::m18_tool_request(&raw)
+        .map(|(name, _)| name == "m18_request_payout")
+        .unwrap_or(false)
+    {
+        // Payout redemption for consumer keys: economy scope, and the
+        // destination must be the key's OWN account (a payout to anyone
+        // else would be a `send` scope, which is never granted).
+        if !scopes.iter().any(|s| s == "economy" || s == "*") {
+            return forbidden("consumer key missing economy scope");
+        }
+        let (_, args) = crate::mcp::m18_tool_request(&raw).unwrap();
+        let amount = args.get("amount_micro_cu").and_then(|v| v.as_u64()).unwrap_or(0);
+        let destination = args
+            .get("destination")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let network = args.get("network").and_then(|v| v.as_str()).unwrap_or("");
+        if destination != account.as_str() {
+            ctx.m18_action = invalid_request(format!(
+                "invalid_destination: consumer keys may only redeem their own account ({account})"
+            ));
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            ctx.m18_action = match (&state.m18, &state.compute, &state.quota_ledger) {
+                (Some(m18), Some(cm), Some(quota)) => match execute_payout(
+                    m18,
+                    &cm.compensation_ledger(),
+                    quota,
+                    amount,
+                    destination,
+                    network,
+                    Some(key_id.as_str()),
+                    now,
+                ) {
+                    Ok(record) => {
+                        cm.persist_compensation();
+                        record
+                    }
+                    Err(e) => e,
+                },
+                _ => serde_json::json!({"error": "economic ledgers not attached"}),
+            };
+        }
     } else if crate::mcp::announce_demand_request(&raw).is_some()
         || crate::mcp::list_demands_request(&raw).is_some()
         || crate::mcp::cancel_demand_request(&raw).is_some()
@@ -11329,7 +11488,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), get_anchor_coverage (economy scope), list_agent_anchors (economy scope), announce_demand (no scope), list_demands (no scope), cancel_demand (no scope), or discover_capabilities (no scope)",
+            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), m18_* tools (economy scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), get_anchor_coverage (economy scope), list_agent_anchors (economy scope), announce_demand (no scope), list_demands (no scope), cancel_demand (no scope), or discover_capabilities (no scope)",
         );
     }
 

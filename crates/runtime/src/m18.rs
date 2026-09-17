@@ -48,11 +48,13 @@ pub struct M18State {
     pub contracts: StdMutex<BTreeMap<String, AgentContract>>,
     pub escrow: StdMutex<decentraai_economy::escrow::EscrowLedger>,
     pub trust: StdMutex<TrustStore>,
+    pub payouts: StdMutex<decentraai_economy::payout::PayoutLedger>,
     pub actions: StdMutex<Vec<M18Action>>,
     pub tick: StdMutex<u64>,
     pub contracts_path: PathBuf,
     pub escrow_path: PathBuf,
     pub trust_path: PathBuf,
+    pub payouts_path: PathBuf,
 }
 
 impl M18State {
@@ -60,6 +62,7 @@ impl M18State {
         let contracts_path = data_dir.join("db/contracts.json");
         let escrow_path = data_dir.join("db/escrow.json");
         let trust_path = data_dir.join("db/trust.json");
+        let payouts_path = data_dir.join("db/payouts.json");
         let contracts = load_json(&contracts_path).unwrap_or_default();
         let mut escrow: decentraai_economy::escrow::EscrowLedger =
             load_json(&escrow_path).unwrap_or_default();
@@ -80,15 +83,18 @@ impl M18State {
             let _ = save_json(&escrow_path, &escrow);
         }
         let trust = load_json(&trust_path).unwrap_or_default();
+        let payouts = load_json(&payouts_path).unwrap_or_default();
         Self {
             contracts: StdMutex::new(contracts),
             escrow: StdMutex::new(escrow),
             trust: StdMutex::new(trust),
+            payouts: StdMutex::new(payouts),
             actions: StdMutex::new(Vec::new()),
             tick: StdMutex::new(0),
             contracts_path,
             escrow_path,
             trust_path,
+            payouts_path,
         }
     }
 
@@ -104,11 +110,13 @@ impl M18State {
             contracts: StdMutex::new(BTreeMap::new()),
             escrow: StdMutex::new(decentraai_economy::escrow::EscrowLedger::default()),
             trust: StdMutex::new(TrustStore::default()),
+            payouts: StdMutex::new(decentraai_economy::payout::PayoutLedger::default()),
             actions: StdMutex::new(Vec::new()),
             tick: StdMutex::new(1),
             contracts_path: base.join("contracts.json"),
             escrow_path: base.join("escrow.json"),
             trust_path: base.join("trust.json"),
+            payouts_path: base.join("payouts.json"),
         }
     }
 
@@ -135,6 +143,10 @@ impl M18State {
     pub fn save_trust(&self) -> Result<(), String> {
         let trust = self.trust.lock().map_err(|e| e.to_string())?;
         save_json(&self.trust_path, &*trust)
+    }
+    pub fn save_payouts(&self) -> Result<(), String> {
+        let payouts = self.payouts.lock().map_err(|e| e.to_string())?;
+        save_json(&self.payouts_path, &*payouts)
     }
 }
 

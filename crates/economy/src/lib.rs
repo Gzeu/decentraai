@@ -36,6 +36,7 @@ pub mod governance_invariants;
 pub mod multiversx_devnet;
 pub mod multiversx_identity;
 pub mod multiversx_tx;
+pub mod payout;
 pub mod settlement;
 pub mod signer;
 pub mod tokenomics;

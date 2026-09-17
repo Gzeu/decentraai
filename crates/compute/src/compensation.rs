@@ -143,8 +143,12 @@ pub fn total_attempts(profile: &ContributionProfile) -> u64 {
 /// moment it was earned**, and the profile is frozen into the audit event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CompensationAccount {
-    /// Total credits ever earned (monotonic).
+    /// Total credits ever earned (monotonic — never decreases, never zeroed).
     pub earned: u64,
+    /// Total credits redeemed via payouts. Old snapshots load 0; history is
+    /// never backfilled. `redeemable = earned − redeemed`.
+    #[serde(default)]
+    pub redeemed: u64,
 }
 
 /// One auditable compensation credit (provenance).
@@ -264,6 +268,54 @@ impl CompensationLedger {
         amount
     }
 
+    /// Spendable compensation balance: lifetime earnings minus lifetime
+    /// redemptions. Read-only, for observability.
+    pub fn redeemable(&self, account: &str) -> u64 {
+        match self.accounts.get(account) {
+            Some(acc) => acc.earned.saturating_sub(acc.redeemed),
+            None => 0,
+        }
+    }
+
+    /// Redeems `amount` of `account`'s earnings under idempotency key
+    /// `ref_id` (the payout id). Fails when `amount` exceeds the redeemable
+    /// balance — a failed redemption moves nothing. `earned` is untouched
+    /// (monotonic); only `redeemed` grows. Emits a `redeem` audit event.
+    /// Returns the amount redeemed.
+    pub fn redeem(&mut self, account: &str, amount: u64, ref_id: &str) -> Result<u64, String> {
+        if self
+            .applied
+            .contains(&("redeem".to_string(), ref_id.to_string()))
+        {
+            return Ok(0); // duplicate: already redeemed this ref_id exactly once.
+        }
+        let acc = self.accounts.entry(account.to_string()).or_default();
+        if acc.earned.saturating_sub(acc.redeemed) < amount {
+            // Failed redemptions consume NO idempotency key: a later retry
+            // after new earnings must still be able to redeem.
+            return Err(format!(
+                "insufficient_balance: redeemable {} < {amount}",
+                acc.earned.saturating_sub(acc.redeemed)
+            ));
+        }
+        self.applied
+            .insert(("redeem".to_string(), ref_id.to_string()));
+        acc.redeemed = acc.redeemed.saturating_add(amount);
+        if self.events.len() >= MAX_COMPENSATION_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(CompensationEvent {
+            op: "redeem".to_string(),
+            account: account.to_string(),
+            amount,
+            ref_id: ref_id.to_string(),
+            policy: self.policy,
+            verified_requests: 0,
+            failed_requests: 0,
+        });
+        Ok(amount)
+    }
+
     /// Writes a crash-safe snapshot (tmp file + rename) of the whole ledger.
     pub fn save_atomic(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
@@ -290,6 +342,61 @@ impl CompensationLedger {
         self.applied = other.applied;
         self.events = other.events;
         self.policy = other.policy;
+    }
+}
+
+#[cfg(test)]
+mod redeem_tests {
+    use super::*;
+
+    fn funded() -> CompensationLedger {
+        let mut ledger = CompensationLedger::new(RewardPolicy::default());
+        let profile = ContributionProfile {
+            cpu_cores: 4,
+            ram_mb: 8192,
+            vram_mb: 0,
+            online_seconds: 3600,
+            verified_requests: 1,
+            failed_requests: 0,
+        };
+        assert!(ledger.credit("w", "e1", &profile) > 0);
+        ledger
+    }
+
+    #[test]
+    fn redeem_moves_earned_to_redeemed_without_touching_earned() {
+        let mut ledger = funded();
+        // The healthy test profile earns exactly 1 (same as measured live).
+        assert_eq!(ledger.account("w").unwrap().earned, 1);
+        assert_eq!(ledger.redeemable("w"), 1);
+        assert_eq!(ledger.redeem("w", 1, "po-1").unwrap(), 1);
+        let acc = ledger.account("w").unwrap();
+        assert_eq!(acc.earned, 1, "earned is monotonic, never decreases");
+        assert_eq!(acc.redeemed, 1);
+        assert_eq!(ledger.redeemable("w"), 0);
+        // Over-redeem fails and moves nothing (failed redemptions do not
+        // consume the idempotency key either).
+        assert!(ledger.redeem("w", 1, "po-2").is_err());
+        assert_eq!(ledger.account("w").unwrap().redeemed, 1);
+        // New earnings unblock the same ref_id (the failed key stayed free).
+        let profile = ContributionProfile {
+            cpu_cores: 4,
+            ram_mb: 8192,
+            vram_mb: 0,
+            online_seconds: 3600,
+            verified_requests: 2,
+            failed_requests: 0,
+        };
+        ledger.credit("w", "e2", &profile);
+        assert!(ledger.redeemable("w") > 0);
+        assert_eq!(
+            ledger.redeem("w", ledger.redeemable("w"), "po-2").unwrap(),
+            ledger.account("w").unwrap().earned - 1
+        );
+        // Duplicate ref_id is a no-op, never a double redeem.
+        let before = ledger.account("w").unwrap().redeemed;
+        assert_eq!(ledger.redeem("w", 1, "po-1").unwrap(), 0);
+        assert_eq!(ledger.account("w").unwrap().redeemed, before);
     }
 }
 

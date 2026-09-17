@@ -433,6 +433,32 @@ impl QuotaLedger {
         Ok(())
     }
 
+    /// Moves `amount` from `available` to `consumed` for a payout
+    /// redemption. Fails when `available` is short — nothing moves, so a
+    /// failed payout never half-applies. Successful moves record a `payout`
+    /// audit event. Idempotent on `ref_id` (the payout id): a retry after a
+    /// crash converges instead of double-moving.
+    pub fn payout_consume(
+        &mut self,
+        account: &AccountId,
+        amount: u64,
+        ref_id: &str,
+        key_id: Option<&str>,
+    ) -> Result<u64, QuotaError> {
+        let available = self.accounts.get(account).map(|a| a.available).unwrap_or(0);
+        if available < amount {
+            return Err(QuotaError::InsufficientQuota { available, requested: amount });
+        }
+        if !self.mark_applied("payout", ref_id) {
+            return Ok(0); // duplicate: already moved for this payout exactly once.
+        }
+        let acc = self.accounts.entry(account.clone()).or_default();
+        acc.available = acc.available.saturating_sub(amount);
+        acc.consumed = acc.consumed.saturating_add(amount);
+        self.record_event("payout", account, amount, ref_id, key_id);
+        Ok(amount)
+    }
+
     /// Marks `(op, ref_id)` as applied; returns `false` if already applied.
     fn mark_applied(&mut self, op: &str, ref_id: &str) -> bool {
         self.applied.insert((op.to_string(), ref_id.to_string()))
@@ -611,6 +637,30 @@ mod tests {
         let mut live = ledger();
         live.restore(back);
         assert_eq!(live.consumed_by_key("ck-aaa"), 0);
+    }
+
+    #[test]
+    fn payout_consume_moves_available_to_consumed() {
+        let mut l = ledger();
+        let acct = "peer-a".to_string();
+        l.credit(&acct, "exec-0", Some(1000), None);
+        let before = l.account(&acct).unwrap();
+        assert_eq!(before.available, 1000);
+        assert_eq!(l.payout_consume(&acct, 300, "po-1", Some("ck-x")).unwrap(), 300);
+        let after = l.account(&acct).unwrap();
+        assert_eq!(after.available, 700);
+        assert_eq!(after.consumed, 300);
+        assert_eq!(after.earned, 1000, "earned untouched by payout");
+        // Short cover fails, nothing moves.
+        assert!(l.payout_consume(&acct, 701, "po-2", None).is_err());
+        assert_eq!(l.account(&acct).unwrap().available, 700);
+        // Duplicate ref is a no-op (crash-retry converges).
+        assert_eq!(l.payout_consume(&acct, 300, "po-1", Some("ck-x")).unwrap(), 0);
+        assert_eq!(l.account(&acct).unwrap().consumed, 300);
+        // Event carries the key.
+        let ev = l.events().iter().rev().find(|e| e.op == "payout").unwrap();
+        assert_eq!(ev.key_id.as_deref(), Some("ck-x"));
+        assert_eq!(ev.ref_id, "po-1");
     }
 
     #[test]

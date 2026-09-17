@@ -1190,6 +1190,16 @@ pub fn all_tools() -> Vec<ToolDef> {
             annotations: ToolAnnotations::additive(),
         },
         ToolDef {
+            name: "m18_request_payout",
+            description: "Redeem compensation earnings into a settled payout record plus matching quota movement (ledger-only settlement: no chain broadcast). The caller redeems their OWN balance: consumer keys may only pay their owner account; amounts below the dust floor, non-erd1 destinations, mainnet network, and over-redeemable amounts are refused with typed errors and move nothing. Mutating: commits three ledgers atomically.",
+            input_schema: json!({ "type": "object", "properties": {
+                "amount_micro_cu": { "type": "integer", "description": "Amount to redeem in micro-CU (integer > 0)" },
+                "destination": { "type": "string", "description": "Destination wallet (erd1 bech32, 32 bytes; must be the caller's own account for consumer keys)" },
+                "network": { "type": "string", "description": "Network label: multiversx-testnet accepted, multiversx-mainnet refused (no custody)" }
+            }, "required": ["amount_micro_cu", "destination", "network"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
             name: "m18_list_trust",
             description: "List all trust anchors. Shows agent wallet, evidence, capability, quality, verification status.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
@@ -2573,6 +2583,7 @@ pub const M18_MUTATION_TOOLS: &[&str] = &[
     "m18_create_escrow",
     "m18_settle_escrow",
     "m18_record_trust",
+    "m18_request_payout",
 ];
 
 pub const M18_READ_TOOLS: &[&str] = &[
@@ -2868,6 +2879,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "m18_list_escrow" => &ctx.m18_escrow,
         "m18_create_escrow" => &ctx.m18_action,
         "m18_settle_escrow" => &ctx.m18_action,
+        "m18_request_payout" => &ctx.m18_action,
         "m18_list_trust" => &ctx.m18_trust,
         // Escrow verdicts (escrowv): precomputed snapshot, both paths.
         "get_escrow_verdicts" => &ctx.escrow_verdicts,
@@ -4049,6 +4061,20 @@ mod tests {
         let t = t.unwrap();
         assert_eq!(t.get("requiredScopes").cloned(), Some(json!(["economy"])));
         assert_eq!(t["annotations"]["readOnlyHint"], true);
+    }
+
+    #[test]
+    fn tools_list_exposes_payout_as_mutating() {
+        let r = call(r#"{"jsonrpc":"2.0","id":15,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let t = tools.iter().find(|t| t["name"] == "m18_request_payout").unwrap();
+        assert_eq!(t["annotations"]["readOnlyHint"], false);
+        assert_eq!(t.get("requiredScopes").cloned(), Some(json!(["economy"])));
+        let req = t["inputSchema"]["required"].as_array().unwrap();
+        for f in &["amount_micro_cu", "destination", "network"] {
+            assert!(req.iter().any(|v| v == *f), "schema must require {f}");
+        }
+        assert!(M18_MUTATION_TOOLS.contains(&"m18_request_payout"));
     }
 
     #[test]
