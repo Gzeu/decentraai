@@ -9741,7 +9741,10 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             "ok": success,
             "capability": capability,
             "explanation": explanation,
-            "quota": {"reserved": true, "settled": success, "tokens_settled": if success {billed} else {0}},
+            // The quota object mirrors the ledger outcome, not the attempt:
+            // failure settles zero (never merely releases), so `settled` is
+            // true and `reserved` false on both paths — matching the events.
+            "quota": {"reserved": false, "settled": true, "tokens_settled": if success {billed} else {0}},
             "receipt": {
                 "request_id": request_id,
                 "capability": capability,
