@@ -6389,9 +6389,12 @@ fn merge_peer_views(
 /// construction — no path can silently diverge again:
 /// `{request_id, capability, model, tokens, tokens_in, tokens_out, pages,
 /// latency_ms, micro_cu_billed, balance_after, quota_consumed, account,
-/// dry_run, rate_card_version, rate_card}`. `account` is the billed quota
-/// account, or null where no account exists (operator paths, dry runs
-/// without one); `dry_run` is always present (false on live calls).
+/// dry_run, est_basis, rate_card_version, rate_card}`. `account` is the
+/// billed quota account, or null where no account exists (operator paths,
+/// dry runs without one); `dry_run` is always present (false on live
+/// calls). `est_basis` names the estimate inputs `{chars, max_tokens,
+/// pages}` so a dry-run bill re-derives offline (live calls carry it too —
+/// same constructor, zero divergence).
 #[allow(clippy::too_many_arguments)]
 fn compute_receipt(
     request_id: String,
@@ -6406,6 +6409,9 @@ fn compute_receipt(
     quota_consumed: u64,
     account: Option<&str>,
     dry_run: bool,
+    est_chars: u64,
+    est_max_tokens: u64,
+    est_pages: u64,
 ) -> serde_json::Value {
     let card = decentraai_compute::RateCard::v1();
     serde_json::json!({
@@ -6422,6 +6428,7 @@ fn compute_receipt(
         "quota_consumed": quota_consumed,
         "account": account,
         "dry_run": dry_run,
+        "est_basis": {"chars": est_chars, "max_tokens": est_max_tokens, "pages": est_pages},
         "rate_card_version": decentraai_compute::RATE_CARD_VERSION,
         "rate_card": {
             "version": card.version,
@@ -8248,6 +8255,9 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                     0,
                     None,
                     true,
+                    est_chars,
+                    est_max_tokens,
+                    est_pages,
                 ),
                 "body": serde_json::Value::Null,
             });
@@ -8288,6 +8298,7 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                         "body": result_json,
                     });
                     if !success {
+                        let (ec, em, ep) = assist_estimate_inputs(&capability, &payload);
                         obj["receipt"] = compute_receipt(
                             format!("cr-{}", &uuid::Uuid::new_v4().to_string()[..12]),
                             &capability,
@@ -8301,6 +8312,9 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                             0,
                             None,
                             false,
+                            ec,
+                            em,
+                            ep,
                         );
                     }
                     obj
@@ -9699,6 +9713,9 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                     0,
                     Some(account),
                     true,
+                    est_chars,
+                    est_max_tokens,
+                    est_pages,
                 ),
                 "body": serde_json::Value::Null,
             });
@@ -9902,6 +9919,9 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 consumed_after,
                 Some(account),
                 false,
+                est_chars,
+                est_max_tokens,
+                est_pages,
             ),
             "body": result_json,
         });
@@ -11761,10 +11781,16 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         let mut capabilities = serde_json::Map::new();
         for tool in tools {
             let name = tool.name;
+            // NOTE: this map is best-effort onboarding text; the AUTHORITATIVE
+            // per-tool scopes live in `requiredScopes` on tools/list.
+            // "operator" below means role-gated: no consumer key can ever
+            // call it, regardless of scopes (proven by the denial test).
             let required_scope = match name {
                 "decide" | "execute_decision" => "none",
                 "decentraai_embeddings" => "embeddings",
                 "decentraai_compute_request" => "compute",
+                "list_workers" | "list_sessions" | "get_quota" | "list_consumer_keys"
+                | "list_executions" => "operator",
                 "hub_publish_task"
                 | "hub_place_bid"
                 | "hub_propose"
@@ -11788,7 +11814,8 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 | "memory_read_entries"
                 | "memory_write_entry" => "memory",
                 "arena_state" | "arena_act" => "arena",
-                "get_revenue" => "economy",
+                "get_revenue" | "get_escrow_verdicts" | "get_anchor_coverage" | "list_agent_anchors"
+                | "renew_quota" => "economy",
                 _ => "none",
             };
             capabilities.insert(
