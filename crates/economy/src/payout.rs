@@ -60,7 +60,9 @@ pub struct PayoutRecord {
     /// Accepted network label (`multiversx-testnet`; `mainnet` refused).
     pub network: String,
     /// Chain tx hash. Always `""` for ledger settlement (nothing broadcast).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Serialized even when empty: the spec promises the key, and readers
+    /// check presence (`""` = ledger settlement, never "missing").
+    #[serde(default)]
     pub tx_hash: String,
     /// Settlement plane. Always `"ledger"` from this node.
     pub settlement: String,
