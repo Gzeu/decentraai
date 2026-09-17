@@ -138,6 +138,8 @@ pub struct McpContext {
     pub revenue: Value,
     /// §1 External demand signal: result of last demand operation.
     pub demand_result: Value,
+    /// Quota renewal (auto): result of last `renew_quota` call.
+    pub renew_result: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -244,6 +246,8 @@ pub fn required_scopes_for(tool_name: &str) -> &'static [&'static str] {
         "get_revenue" | "get_escrow_verdicts" | "get_anchor_coverage" | "list_agent_anchors" => {
             &["economy"]
         }
+        // Quota renewal (auto): economy scope, like revenue.
+        "renew_quota" => &["economy"],
         // Demand signal tools — available to all authenticated users
         "announce_demand" | "list_demands" | "cancel_demand" => &[],
         // Orchestrate scope
@@ -328,6 +332,20 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
             annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "renew_quota",
+            description: "Renew a consumer key's quota window: converts the owner account's already-earned-but-unspent compensation into spendable quota (never net-new value) and extends the key's quota period. Mutating: commits two ledgers plus the key registry atomically. Unknown keys are refused with a stable error and create nothing.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key_id": { "type": "string", "description": "Consumer key id to renew (e.g. 'ck-...')" },
+                    "amount_micro_cu": { "type": "integer", "description": "Micro-CU to convert (0/absent = full redeemable balance)", "default": 0 }
+                },
+                "required": ["key_id"],
+                "additionalProperties": false
+            }),
+            annotations: ToolAnnotations::additive(),
         },
         // §1 External demand signal tools
         ToolDef {
@@ -1691,6 +1709,29 @@ pub fn agent_anchors_request(raw: &str) -> Option<(String, String, usize)> {
     Some((agent_id, cursor, limit))
 }
 
+/// Extracts a `renew_quota` tool call. Returns (key_id, amount or 0).
+/// Pure.
+pub fn renew_quota_request(raw: &str) -> Option<(String, u64)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "renew_quota" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let key_id = args.get("key_id").and_then(|v| v.as_str())?.to_string();
+    if key_id.is_empty() {
+        return None;
+    }
+    let amount = args.get("amount_micro_cu").and_then(|v| v.as_u64()).unwrap_or(0);
+    Some((key_id, amount))
+}
+
 /// §1 Demand signal parsers
 pub fn announce_demand_request(raw: &str) -> Option<Value> {
     let Ok(msg) = serde_json::from_str::<Value>(raw) else {
@@ -2830,6 +2871,8 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "get_quota" => &ctx.quota,
         "get_compensation" => &ctx.compensation,
         "get_revenue" => &ctx.revenue,
+        // Quota renewal (auto): populated per-request (needs key_id).
+        "renew_quota" => &ctx.renew_result,
         // §1 Demand tools
         "announce_demand" | "list_demands" | "cancel_demand" => &ctx.demand_result,
         "list_consumer_keys" => &ctx.consumer_keys,
@@ -2964,6 +3007,7 @@ mod tests {
             orchestrate_status_result: json!({}),
             revenue: json!({}),
             demand_result: json!({}),
+            renew_result: json!({}),
         }
     }
 
@@ -4075,6 +4119,31 @@ mod tests {
             assert!(req.iter().any(|v| v == *f), "schema must require {f}");
         }
         assert!(M18_MUTATION_TOOLS.contains(&"m18_request_payout"));
+    }
+
+    #[test]
+    fn renew_quota_request_parses_key_and_amount() {
+        let full = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"renew_quota","arguments":{"key_id":"ck-abc","amount_micro_cu":250}}}"#;
+        assert_eq!(
+            renew_quota_request(full),
+            Some(("ck-abc".to_string(), 250))
+        );
+        let minimal = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"renew_quota","arguments":{"key_id":"ck-abc"}}}"#;
+        assert_eq!(
+            renew_quota_request(minimal),
+            Some(("ck-abc".to_string(), 0))
+        );
+        let missing = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"renew_quota","arguments":{}}}"#;
+        assert!(renew_quota_request(missing).is_none());
+    }
+
+    #[test]
+    fn tools_list_exposes_renew_quota_as_mutating() {
+        let r = call(r#"{"jsonrpc":"2.0","id":16,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let t = tools.iter().find(|t| t["name"] == "renew_quota").unwrap();
+        assert_eq!(t.get("requiredScopes").cloned(), Some(json!(["economy"])));
+        assert_eq!(t["annotations"]["readOnlyHint"], false);
     }
 
     #[test]

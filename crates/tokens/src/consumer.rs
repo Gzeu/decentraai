@@ -84,6 +84,13 @@ pub struct ConsumerKeyRecord {
     /// time — an expired key stops authenticating like a revoked one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    /// Quota window end (Unix seconds) for this key; `None` = no window
+    /// (grandfathered keys spend while the account funds them). Set by
+    /// `renew_quota`; enforced at reservation time — a lapsed window
+    /// refuses new reservations until renewed. Old records load `None`,
+    /// so existing keys never expire by surprise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_expires_at: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -218,6 +225,7 @@ impl ConsumerKeyStore {
             rate_limit_per_minute,
             scopes,
             expires_at,
+            quota_expires_at: None,
         };
         let hash = hash_key(&plaintext);
         self.keys.insert(hash, record);
@@ -258,6 +266,19 @@ impl ConsumerKeyStore {
                 tracing::warn!("failed to persist consumer key last_used_at");
             }
         }
+    }
+
+    /// Sets the quota window end for a key (renewal). Persists immediately;
+    /// a write failure is returned (unlike the best-effort `touch_used` —
+    /// renewal must never report success it did not store).
+    pub fn set_quota_expiry(&mut self, key_id: &str, expires_at: u64) -> Result<()> {
+        let rec = self
+            .keys
+            .values_mut()
+            .find(|r| r.key_id == key_id && !r.revoked)
+            .with_context(|| format!("no active consumer key '{key_id}'"))?;
+        rec.quota_expires_at = Some(expires_at);
+        self.save()
     }
 
     /// Revokes a key by id; it stops authenticating immediately.
@@ -310,6 +331,29 @@ mod tests {
         assert_eq!(rec.owner_account, "acct-1");
         assert_eq!(rec.quota_ceiling, 100);
         assert_eq!(rec.rate_limit_per_minute, 10);
+    }
+
+    #[test]
+    fn quota_window_defaults_absent_and_sets_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        let plaintext = store.create("acct-1", 100, 10, vec![]).unwrap();
+        let rec = store.lookup(&plaintext).unwrap();
+        assert_eq!(rec.quota_expires_at, None, "new keys carry no window");
+        let key_id = rec.key_id.clone();
+        store.set_quota_expiry(&key_id, 9_999_999_999).unwrap();
+        assert_eq!(
+            store.lookup(&plaintext).unwrap().quota_expires_at,
+            Some(9_999_999_999)
+        );
+        // Unknown keys are refused, never created.
+        assert!(store.set_quota_expiry("ck-nope", 1).is_err());
+        // Old files without the field load clean (never expire by surprise).
+        let reloaded = open(dir.path());
+        assert_eq!(
+            reloaded.lookup(&plaintext).unwrap().quota_expires_at,
+            Some(9_999_999_999)
+        );
     }
 
     #[test]

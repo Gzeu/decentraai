@@ -459,6 +459,33 @@ impl QuotaLedger {
         Ok(amount)
     }
 
+    /// Credits renewal-funded quota: adds `amount` to both `earned` and
+    /// `available` of `account`, audited as a `renew` event. This is the
+    /// ONLY mint path besides measured-work `credit` — callers must fund
+    /// it from an already-earned balance (compensation redeemable), never
+    /// from nothing; the method itself cannot verify funding, so the
+    /// renewal flow (not this primitive) owns that invariant. Idempotent
+    /// on `ref_id` (the renewal id): a crash-retry converges.
+    pub fn renew_credit(
+        &mut self,
+        account: &AccountId,
+        amount: u64,
+        ref_id: &str,
+        key_id: Option<&str>,
+    ) -> u64 {
+        if amount == 0 {
+            return 0;
+        }
+        if !self.mark_applied("renew", ref_id) {
+            return 0; // duplicate: already renewed under this id exactly once.
+        }
+        let acc = self.accounts.entry(account.clone()).or_default();
+        acc.earned = acc.earned.saturating_add(amount);
+        acc.available = acc.available.saturating_add(amount);
+        self.record_event("renew", account, amount, ref_id, key_id);
+        amount
+    }
+
     /// Marks `(op, ref_id)` as applied; returns `false` if already applied.
     fn mark_applied(&mut self, op: &str, ref_id: &str) -> bool {
         self.applied.insert((op.to_string(), ref_id.to_string()))
@@ -661,6 +688,22 @@ mod tests {
         let ev = l.events().iter().rev().find(|e| e.op == "payout").unwrap();
         assert_eq!(ev.key_id.as_deref(), Some("ck-x"));
         assert_eq!(ev.ref_id, "po-1");
+    }
+
+    #[test]
+    fn renew_credit_funds_from_nothing_but_marks_source() {
+        // renew_credit itself cannot verify funding — the renewal FLOW owns
+        // that invariant (it redeems compensation first). The primitive
+        // only guarantees auditability (renew op + ref) and idempotency.
+        let mut l = ledger();
+        let acct = "peer-a".to_string();
+        assert_eq!(l.renew_credit(&acct, 500, "renew:rq-1", Some("ck-a")), 500);
+        let acc = l.account(&acct).unwrap();
+        assert_eq!((acc.earned, acc.available, acc.consumed), (500, 500, 0));
+        assert_eq!(l.renew_credit(&acct, 500, "renew:rq-1", Some("ck-a")), 0);
+        let ev = l.events().iter().rev().find(|e| e.op == "renew").unwrap();
+        assert_eq!(ev.ref_id, "renew:rq-1");
+        assert_eq!(ev.key_id.as_deref(), Some("ck-a"));
     }
 
     #[test]

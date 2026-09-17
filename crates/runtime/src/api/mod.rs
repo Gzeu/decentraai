@@ -153,6 +153,15 @@ struct ConsumerQuotaGuard {
     settled: bool,
 }
 
+/// Denial reasons for [`ApiState::reserve_consumer_quota`], so callers can
+/// answer honestly instead of collapsing everything into "no quota".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReserveDeny {
+    NoLedger,
+    NoSpendable,
+    WindowExpired,
+}
+
 impl ConsumerQuotaGuard {
     fn new(ledger: Arc<StdMutex<decentraai_compute::QuotaLedger>>, reservation_id: String) -> Self {
         Self {
@@ -1526,8 +1535,33 @@ impl ApiState {
         key_id: &str,
         request_id: &str,
         quota_ceiling: u64,
-    ) -> Option<ConsumerQuotaGuard> {
-        let ledger = self.quota_ledger.clone()?;
+    ) -> Result<ConsumerQuotaGuard, ReserveDeny> {
+        let Some(ledger) = self.quota_ledger.clone() else {
+            return Err(ReserveDeny::NoLedger);
+        };
+        // Quota window enforcement: a lapsed `quota_expires_at` refuses new
+        // reservations until `renew_quota` extends it. `None` = no window
+        // (grandfathered keys spend while the account funds them).
+        if let Some(path) = &self.consumer_keys_path {
+            if let Ok(store) = decentraai_tokens::ConsumerKeyStore::load(path) {
+                if let Some(rec) = store.list().iter().find(|r| r.key_id == key_id) {
+                    if let Some(exp) = rec.quota_expires_at {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if now >= exp {
+                            decentraai_audit::record_best_effort(
+                                &self.info.repo_root.join("logs"),
+                                "consumer_quota_expired",
+                                serde_json::json!({ "key_id": key_id, "account": account, "request_id": request_id }),
+                            );
+                            return Err(ReserveDeny::WindowExpired);
+                        }
+                    }
+                }
+            }
+        }
         let reservation_id = format!("consumer:{key_id}:{request_id}");
         {
             let mut ledger = ledger.lock().unwrap();
@@ -1540,7 +1574,7 @@ impl ApiState {
                     "consumer_quota_denied",
                     serde_json::json!({ "key_id": key_id, "account": account, "request_id": request_id }),
                 );
-                return None;
+                return Err(ReserveDeny::NoSpendable);
             }
             if ledger
                 .reserve_with_key(
@@ -1556,10 +1590,10 @@ impl ApiState {
                     "consumer_quota_denied",
                     serde_json::json!({ "key_id": key_id, "account": account, "request_id": request_id }),
                 );
-                return None;
+                return Err(ReserveDeny::NoSpendable);
             }
         }
-        Some(ConsumerQuotaGuard::new(ledger, reservation_id))
+        Ok(ConsumerQuotaGuard::new(ledger, reservation_id))
     }
 }
 
@@ -1820,6 +1854,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/agents/workflow", post(collective_workflow_handler))
         .route("/v1/agents/capabilities", get(agents_capabilities_handler))
         .route("/v1/agents/orchestrate", post(agents_orchestrate_handler))
+        .route("/v1/agent/pass", post(agent_pass_handler))
         .route("/v1/intel/plan", post(intel_plan_handler))
         .route("/v1/intel/status", get(intel_status_handler))
         .route("/v1/intel/assist", post(intel_assist_handler))
@@ -5793,6 +5828,7 @@ fn mcp_wallet_mutation_request(raw: &str) -> bool {
         || crate::mcp::agent_memory_write_request(raw).is_some()
         || crate::mcp::compute_request(raw).is_some()
         || crate::mcp::embeddings_request(raw).is_some()
+        || crate::mcp::renew_quota_request(raw).is_some()
         // M18 Economic Layer mutations
         || crate::mcp::m18_tool_request(raw)
             .map(|(name, _)| crate::mcp::M18_MUTATION_TOOLS.contains(&name.as_str()))
@@ -6075,11 +6111,145 @@ fn execute_payout(
     Ok(serde_json::to_value(&record).unwrap_or(serde_json::json!({})))
 }
 
+/// Quota window granted per renewal: 30 days. Named constant so the
+/// period is inspectable; changing it only affects future renewals.
+pub const QUOTA_PERIOD_SECS: u64 = 30 * 86400;
+
+/// Executes a quota renewal: converts the owner account's already-earned
+/// but unspent compensation into spendable quota (never net-new value)
+/// and extends the key's quota window. Funding is audited on both ledgers
+/// under the same `renew:<id>` reference. Unknown/revoked keys are refused
+/// with a stable error and create nothing. The key registry write lands
+/// BEFORE the ledger moves, so a store failure leaves money untouched
+/// (window extensions alone grant nothing); ledger moves thereafter are
+/// infallible by construction (validated upfront, saturating math).
+/// Returns the §7 response object, or a §1.4 typed error.
+#[allow(clippy::too_many_arguments)]
+fn execute_renewal(
+    keys_path: Option<&std::path::PathBuf>,
+    comp: &std::sync::Arc<std::sync::Mutex<decentraai_compute::CompensationLedger>>,
+    quota: &std::sync::Arc<std::sync::Mutex<decentraai_compute::QuotaLedger>>,
+    cm: &decentraai_distributed::ComputeManager,
+    key_id: &str,
+    amount: u64,
+    now: u64,
+    caller: Option<&str>,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let Some(path) = keys_path else {
+        return Err(serde_json::json!({"error": "consumer key registry not attached"}));
+    };
+    let mut store = decentraai_tokens::ConsumerKeyStore::load(path)
+        .map_err(|e| serde_json::json!({"error": format!("key registry unreadable: {e}")}))?;
+    let owner = store
+        .list()
+        .iter()
+        .find(|r| r.key_id == key_id && !r.revoked)
+        .map(|r| r.owner_account.clone())
+        .ok_or_else(|| invalid_request(format!("unknown_consumer_key: {key_id}")))?;
+    // A consumer key renews only keys of its own owner account (renewing
+    // another account would move someone else's earnings without consent).
+    // Operator/master calls pass no caller and are unconstrained.
+    if let Some(caller) = caller {
+        if owner != caller {
+            return Err(invalid_request(format!(
+                "foreign_key_renewal_forbidden: {key_id} belongs to another account"
+            )));
+        }
+    }
+    // Funding bound: what the owner earned but never spent or redeemed.
+    // Requested 0/absent = the node's default renewal (full redeemable).
+    let fuel = {
+        let comp = comp.lock().unwrap();
+        let redeemable = comp.redeemable(&owner);
+        let want = if amount == 0 { redeemable } else { amount };
+        want.min(redeemable)
+    };
+    if fuel == 0 {
+        return Err(invalid_request(format!(
+            "insufficient_balance: nothing earned-but-unspent to convert for {owner}"
+        )));
+    }
+    let renewal_id = format!("rq-{}", &uuid::Uuid::new_v4().to_string()[..12]);
+    let expires_at = now.saturating_add(QUOTA_PERIOD_SECS);
+    // Window first (grants nothing by itself), then the funded moves.
+    store
+        .set_quota_expiry(key_id, expires_at)
+        .map_err(|e| serde_json::json!({"error": format!("renewal window not stored: {e}")}))?;
+    {
+        let mut comp = comp.lock().unwrap();
+        let mut quota = quota.lock().unwrap();
+        comp.redeem(&owner, fuel, &format!("renew:{renewal_id}"))
+            .map_err(|e| invalid_request(e.to_string()))?;
+        quota.renew_credit(
+            &owner,
+            fuel,
+            &format!("renew:{renewal_id}"),
+            Some(key_id),
+        );
+    }
+    cm.persist_compensation();
+    let (available, consumed) = {
+        let quota = quota.lock().unwrap();
+        let acc = quota.account(&owner);
+        (
+            acc.map(|a| a.available).unwrap_or(0),
+            acc.map(|a| a.consumed).unwrap_or(0),
+        )
+    };
+    Ok(serde_json::json!({
+        "ok": true,
+        "key_id": key_id,
+        "quota_available": available,
+        "quota_consumed": consumed,
+        "renewed_micro_cu": fuel,
+        "expires_at": expires_at,
+        "renewal_id": renewal_id,
+    }))
+}
+
 /// §1.4 error contract for policy refusals: a stable machine-readable
 /// shape `{error: {message, type: "invalid_request"}}`. Only NEW refusals
 /// use it; every legacy error surface stays byte-identical.
 fn invalid_request(msg: impl Into<String>) -> serde_json::Value {
     serde_json::json!({"error": {"message": msg.into(), "type": "invalid_request"}})
+}
+
+/// Computes one autopilot tick as a PURE read-only projection over the hub:
+/// for every open/bidding task (capped, deterministic id order), the action
+/// the daemon would take, mirroring the execute award rule (team → best bid
+/// → issuer fallback). Takes `&HubState`, so mutation is impossible by
+/// construction — dry_run is structural, not a flag that could be ignored.
+/// Same hub tick + same market ⇒ byte-identical output (idempotent).
+fn agent_pass_plan(hub: &decentraai_agent_hub::HubState) -> Vec<serde_json::Value> {
+    use decentraai_agent_hub::TaskStatus;
+    hub.tasks
+        .values()
+        .filter(|t| matches!(t.status, TaskStatus::Open | TaskStatus::Bidding))
+        .take(50)
+        .map(|task| {
+            if let Some(team) = hub.teams.values().find(|tm| tm.task_id == task.id) {
+                let members: Vec<&String> =
+                    team.members.iter().map(|(m, _)| m).collect();
+                serde_json::json!({
+                    "tool": "hub_execute",
+                    "ref": task.id,
+                    "effect": format!("settle team {:?} ~{} CU", members, task.reward),
+                })
+            } else if let Some(best) = hub.best_bid(&task.id) {
+                serde_json::json!({
+                    "tool": "hub_execute",
+                    "ref": task.id,
+                    "effect": format!("award {} ~{} CU", best.bidder, task.reward),
+                })
+            } else {
+                serde_json::json!({
+                    "tool": "hub_execute",
+                    "ref": task.id,
+                    "effect": format!("settle to issuer {} (no bids) ~{} CU", task.issuer, task.reward),
+                })
+            }
+        })
+        .collect()
 }
 
 fn extract_tool_name(raw: &str) -> Option<String> {
@@ -6448,6 +6618,31 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
             None => {
                 serde_json::json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null })
             }
+        };
+    }
+    // Quota renewal (auto): converts the owner account's earned-but-unspent
+    // compensation into spendable quota (never net-new) and extends the
+    // key's quota window. Operator path: any key (operator premise).
+    if let Some((key_id, amount)) = crate::mcp::renew_quota_request(&raw) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ctx.renew_result = match (&state.compute, &state.quota_ledger) {
+            (Some(cm), Some(quota)) => match execute_renewal(
+                state.consumer_keys_path.as_ref(),
+                &cm.compensation_ledger(),
+                quota,
+                cm,
+                &key_id,
+                amount,
+                now,
+                None,
+            ) {
+                Ok(v) => v,
+                Err(e) => e,
+            },
+            _ => serde_json::json!({"error": "economic ledgers not attached"}),
         };
     }
     // §2.6 Revenue: node contribution state + quota summary (read-only).
@@ -8044,6 +8239,7 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 "last_used_at": if u.last_used > 0 { Some(u.last_used) } else { None },
                 "account_quota": { "available": available, "consumed": consumed },
                 "quota_consumed": by_key,
+                "quota_expires_at": k.quota_expires_at,
             })
         }).collect::<Vec<_>>() });
     }
@@ -9076,10 +9272,13 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             }
         }
         let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
-        let Some(mut guard) =
-            state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
-        else {
-            return forbidden("no spendable quota for this consumer account");
+        let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
+        {
+            Ok(g) => g,
+            Err(ReserveDeny::WindowExpired) => {
+                return forbidden("quota period expired for this key — renew_quota to extend it")
+            }
+            Err(_) => return forbidden("no spendable quota for this consumer account"),
         };
         // Execute via embeddings path if available, otherwise stub.
         // Try real embedding client first; fall back to stub with proper note.
@@ -9267,10 +9466,13 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             return forbidden("no connected workers for compute assist");
         }
         let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
-        let Some(mut guard) =
-            state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
-        else {
-            return forbidden("no spendable quota for this consumer account");
+        let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
+        {
+            Ok(g) => g,
+            Err(ReserveDeny::WindowExpired) => {
+                return forbidden("quota period expired for this key — renew_quota to extend it")
+            }
+            Err(_) => return forbidden("no spendable quota for this consumer account"),
         };
         let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
         let (success, result_payload, explanation) = crate::intel_assist::run_assist_request(
@@ -9385,10 +9587,13 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         // Quota reservation for this request (request_id from a monotonic
         // timestamp + key — idempotent across a retry of the same key+instant).
         let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
-        let Some(mut guard) =
-            state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
-        else {
-            return forbidden("no spendable quota for this consumer account");
+        let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
+        {
+            Ok(g) => g,
+            Err(ReserveDeny::WindowExpired) => {
+                return forbidden("quota period expired for this key — renew_quota to extend it")
+            }
+            Err(_) => return forbidden("no spendable quota for this consumer account"),
         };
         // Execute through the existing fabric (decide→reserve→execute).
         let resp = run_execute_decision(state, &args).await;
@@ -10187,13 +10392,14 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                             "serve_model" | "pull_model" | "list_consumer_keys"
                             | "get_compensation" => false,
                             // M18 Economic Layer + §2.6 Revenue + escrow verdicts +
-                            // anchor coverage/history: available with "economy"
-                            // scope or "*"
+                            // anchor coverage/history + quota renewal: available
+                            // with "economy" scope or "*"
                             name if name.starts_with("m18_")
                                 || name == "get_revenue"
                                 || name == "get_escrow_verdicts"
                                 || name == "get_anchor_coverage"
-                                || name == "list_agent_anchors" =>
+                                || name == "list_agent_anchors"
+                                || name == "renew_quota" =>
                             {
                                 scopes.iter().any(|s| s == "economy" || s == "*")
                             }
@@ -11384,6 +11590,32 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 _ => serde_json::json!({"error": "economic ledgers not attached"}),
             };
         }
+    } else if let Some((key_id, amount)) = crate::mcp::renew_quota_request(&raw) {
+        // Quota renewal (auto) for consumer keys: economy scope, and only
+        // the key's own owner account may be renewed through it.
+        if !scopes.iter().any(|s| s == "economy" || s == "*") {
+            return forbidden("consumer key missing economy scope");
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ctx.renew_result = match (&state.compute, &state.quota_ledger) {
+            (Some(cm), Some(quota)) => match execute_renewal(
+                state.consumer_keys_path.as_ref(),
+                &cm.compensation_ledger(),
+                quota,
+                cm,
+                &key_id,
+                amount,
+                now,
+                Some(account.as_str()),
+            ) {
+                Ok(v) => v,
+                Err(e) => e,
+            },
+            _ => serde_json::json!({"error": "economic ledgers not attached"}),
+        };
     } else if crate::mcp::announce_demand_request(&raw).is_some()
         || crate::mcp::list_demands_request(&raw).is_some()
         || crate::mcp::cancel_demand_request(&raw).is_some()
@@ -11488,7 +11720,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), m18_* tools (economy scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), get_anchor_coverage (economy scope), list_agent_anchors (economy scope), announce_demand (no scope), list_demands (no scope), cancel_demand (no scope), or discover_capabilities (no scope)",
+            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), m18_* tools (economy scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), get_anchor_coverage (economy scope), list_agent_anchors (economy scope), renew_quota (economy scope), announce_demand (no scope), list_demands (no scope), cancel_demand (no scope), or discover_capabilities (no scope)",
         );
     }
 
@@ -11789,6 +12021,8 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         revenue: serde_json::json!({}),
         // §1 Demand signals: empty until mcp_handler populates it.
         demand_result: serde_json::json!({}),
+        // Quota renewal (auto): empty until the handler populates it.
+        renew_result: serde_json::json!({}),
     }
 }
 
@@ -14599,8 +14833,11 @@ async fn governor_execute_handler(
                     .unwrap_or(0)
             );
             match state.reserve_consumer_quota(account, key_id, &rid, *quota_ceiling) {
-                Some(g) => Some(g),
-                None => return forbidden("no spendable consumer quota"),
+                Ok(g) => Some(g),
+                Err(ReserveDeny::WindowExpired) => {
+                    return forbidden("quota period expired for this key — renew_quota to extend it")
+                }
+                Err(_) => return forbidden("no spendable consumer quota"),
             }
         }
         _ => return forbidden("operator or consumer key required"),
@@ -16455,6 +16692,68 @@ async fn memory_transition_handler(
     }
 }
 
+/// `POST /v1/agent/pass` — one autopilot tick as a PURE read-only
+/// projection (auto). Computes what the external daemon would do this
+/// tick and returns it as `actions`, without mutating anything: the
+/// planner only ever sees `&HubState`, so dry_run is structural.
+/// `dry_run` defaults true; `false` is refused (this route never executes).
+/// Operator-gated; deterministic (`tick_id` binds hub tick + agent).
+async fn agent_pass_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "invalid JSON body"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let agent_id = v.get("agent_id").and_then(|a| a.as_str()).unwrap_or("");
+    if agent_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "agent_id is required"}).to_string(),
+        )
+            .into_response();
+    }
+    let dry_run = v.get("dry_run").and_then(|d| d.as_bool()).unwrap_or(true);
+    if !dry_run {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "agent pass is read-only: dry_run must be true", "type": "invalid_request"}}).to_string(),
+        )
+            .into_response();
+    }
+    let hub = state.hub.lock().await;
+    let actions = agent_pass_plan(&hub);
+    let tick_id = format!(
+        "tk-{}-{}",
+        hub.tick,
+        &blake3::hash(agent_id.as_bytes()).to_hex()[..12]
+    );
+    drop(hub);
+    (
+        StatusCode::OK,
+        serde_json::json!({
+            "ok": true,
+            "agent_id": agent_id,
+            "tick_id": tick_id,
+            "dry_run": true,
+            "actions": actions,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
 async fn agents_orchestrate_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -18205,11 +18504,22 @@ async fn proxy_with_auth(
             // request => each request reserves and settles on its own.
             let request_tag = format!("{}:{:?}", uri, std::time::Instant::now());
             match state.reserve_consumer_quota(account, key_id, &request_tag, *quota_ceiling) {
-                Some(guard) => Some(guard),
+                Ok(guard) => Some(guard),
+                // A lapsed quota window is denied distinctly from an empty
+                // account (separate stable type so readers can tell them apart).
+                Err(ReserveDeny::WindowExpired) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        "{\"error\":{\"message\":\"quota period expired for this key — renew_quota to extend it\",\"type\":\"quota_expired\"}}"
+                            .to_string(),
+                    )
+                        .into_response();
+                }
                 // A classified consumer key with no spendable quota is denied.
-                // (None also means "no ledger attached", but a consumer key can
+                // (NoLedger also lands here, but a consumer key can
                 // only authenticate when the ledger is wired — see classify.)
-                None => {
+                Err(_) => {
                     return (
                         StatusCode::FORBIDDEN,
                         [(header::CONTENT_TYPE, "application/json")],
@@ -19121,6 +19431,26 @@ mod tests {
         assert!(!anchor_is_sim_linked(&contracts, &anchor(None)));
         // Linked to missing contract: counts (cannot prove sim).
         assert!(!anchor_is_sim_linked(&contracts, &anchor(Some("ct-x"))));
+    }
+
+    #[test]
+    fn agent_pass_plan_is_pure_deterministic_and_capped() {
+        use decentraai_agent_hub::HubState;
+        let mut hub = HubState::new();
+        let t1 = hub.publish_task("iss".into(), "A".into(), "d".into(), 100, None);
+        let t2 = hub.publish_task("iss".into(), "B".into(), "d".into(), 200, None);
+        hub.place_bid("w1".into(), t1.id.clone(), 90, "r".into()).unwrap();
+        let snap = serde_json::to_string(&hub.tasks).unwrap();
+        let first = agent_pass_plan(&hub);
+        let second = agent_pass_plan(&hub);
+        assert_eq!(first, second, "same market state yields identical plans");
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0]["tool"], "hub_execute");
+        assert!(first[0]["effect"].as_str().unwrap().contains("w1"));
+        assert!(first[1]["effect"].as_str().unwrap().contains("iss"));
+        // Purity: planning touched nothing.
+        assert_eq!(serde_json::to_string(&hub.tasks).unwrap(), snap);
+        let _ = t2;
     }
 
     #[test]
