@@ -911,13 +911,14 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "decentraai_compute_request",
-            description: "Request remote compute assistance (L1 ASSIST, Sharing is Caring DFCP). Requires a consumer key with 'compute' or matching capability scope. The fabric planner decides the worker; the caller never selects a peer. Rate-limited, quota-gated, audited. Metered billing (§7): the response nests a receipt {request_id, capability, model, tokens, tokens_in/out, latency_ms, micro_cu_billed, balance_after, rate_card_version, rate_card} billed from measured usage under the versioned rate card; over-quota calls are refused with quota_exceeded and charge nothing.",
+            description: "Request remote compute assistance (L1 ASSIST, Sharing is Caring DFCP). Requires a consumer key with 'compute' or matching capability scope. The fabric planner decides the worker; the caller never selects a peer. Rate-limited, quota-gated, audited. Metered billing (§7): the response nests a receipt {request_id, capability, model, tokens, tokens_in/out, latency_ms, micro_cu_billed, balance_after, rate_card_version, rate_card} billed from measured usage under the versioned rate card; over-quota calls are refused with quota_exceeded and charge nothing. Pass dry_run:true for the billing chain without spending (estimate receipt, no reservation).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "capability": { "type": "string", "description": "Capability to offload, e.g. 'embeddings', 'ocr', 'chat'." },
                     "payload": { "type": "object", "description": "Task payload as JSON (e.g. {\"input\":\"text\"} or {\"messages\":[...]})" },
-                    "lease_seconds": { "type": "integer", "description": "Max lease in seconds (1..120, default 60)." }
+                    "lease_seconds": { "type": "integer", "description": "Max lease in seconds (1..120, default 60)." },
+                    "dry_run": { "type": "boolean", "description": "Billing estimate only: full receipt with estimated bill, zero reservation/consumption (default false)." }
                 },
                 "required": ["capability", "payload"],
                 "additionalProperties": false
@@ -2494,6 +2495,27 @@ pub fn compute_request(raw: &str) -> Option<(String, Value, u64)> {
         .unwrap_or(60)
         .clamp(1, 120);
     Some((capability, payload, lease))
+}
+
+/// Whether a `decentraai_compute_request` asks for a dry run: the full
+/// billing chain (estimate + rate card + receipt composition) with zero
+/// reservation, zero execution, zero consumption. Pure.
+pub fn compute_dry_run(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    let params = msg.get("params");
+    if params.and_then(|p| p.get("name")).and_then(|n| n.as_str()) != Some("decentraai_compute_request") {
+        return false;
+    }
+    params
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("dry_run"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// M17: extract `orchestrate_propose` parameters.
@@ -4119,6 +4141,16 @@ mod tests {
             assert!(req.iter().any(|v| v == *f), "schema must require {f}");
         }
         assert!(M18_MUTATION_TOOLS.contains(&"m18_request_payout"));
+    }
+
+    #[test]
+    fn compute_dry_run_flags_estimate_only_calls() {
+        let dry = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"decentraai_compute_request","arguments":{"capability":"chat","payload":{},"dry_run":true}}}"#;
+        assert!(compute_dry_run(dry));
+        let live = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"decentraai_compute_request","arguments":{"capability":"chat","payload":{}}}}"#;
+        assert!(!compute_dry_run(live));
+        let other = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"decide","arguments":{"dry_run":true}}}"#;
+        assert!(!compute_dry_run(other));
     }
 
     #[test]

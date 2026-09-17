@@ -1529,12 +1529,38 @@ impl ApiState {
     /// ledger, capped at `min(account.available, quota_ceiling)`. Returns a
     /// RAII guard: on success the caller settles it with measured usage; on
     /// any other exit the guard's `Drop` releases the reservation (no leak).
+    /// Uniform no-spendable-quota refusal: stable `insufficient_quota`
+    /// token with the live (available, reserved) breakdown, so a parked
+    /// balance never reads as an absent one. Callers that estimate cost
+    /// upfront use `quota_exceeded` instead (would-exceed vs is-empty —
+    /// two facts, two stable tokens, both machine-readable).
+    fn insufficient_quota(available: u64, reserved: u64) -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(
+                "{{\"error\":{{\"message\":\"insufficient_quota: no spendable quota (available {available}, reserved {reserved})\",\"type\":\"insufficient_quota\"}}}}"
+            ),
+        )
+            .into_response()
+    }
+
+    /// Live (available, reserved) snapshot for refusal breakdowns.
+    fn quota_levels(&self, account: &str) -> (u64, u64) {
+        self.quota_ledger
+            .as_ref()
+            .and_then(|l| l.lock().unwrap().account(&account.to_string()))
+            .map(|a| (a.available, a.reserved))
+            .unwrap_or((0, 0))
+    }
+
     fn reserve_consumer_quota(
         &self,
         account: &str,
         key_id: &str,
         request_id: &str,
         quota_ceiling: u64,
+        reserve_cap: Option<u64>,
     ) -> Result<ConsumerQuotaGuard, ReserveDeny> {
         let Some(ledger) = self.quota_ledger.clone() else {
             return Err(ReserveDeny::NoLedger);
@@ -1567,7 +1593,11 @@ impl ApiState {
             let mut ledger = ledger.lock().unwrap();
             let acc = ledger.account(&account.to_string());
             let available = acc.map(|a| a.available).unwrap_or(0);
-            let amount = available.min(quota_ceiling);
+            // Callers with a cost estimate cap the hold to it (dust-sized
+            // holds instead of whole-balance holds); the default reserves
+            // the historic ceiling chunk.
+            let cap = reserve_cap.unwrap_or(u64::MAX);
+            let amount = available.min(quota_ceiling).min(cap);
             if amount == 0 {
                 decentraai_audit::record_best_effort(
                     &self.info.repo_root.join("logs"),
@@ -9339,13 +9369,16 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             }
         }
         let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
-        let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
+        let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling, None)
         {
             Ok(g) => g,
             Err(ReserveDeny::WindowExpired) => {
                 return forbidden("quota period expired for this key — renew_quota to extend it")
             }
-            Err(_) => return forbidden("no spendable quota for this consumer account"),
+            Err(_) => {
+                let (available, reserved) = state.quota_levels(account);
+                return ApiState::insufficient_quota(available, reserved);
+            }
         };
         // Execute via embeddings path if available, otherwise stub.
         // Try real embedding client first; fall back to stub with proper note.
@@ -9483,6 +9516,67 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 capability
             ));
         }
+        let card = decentraai_compute::RateCard::v1();
+        let (est_chars, est_max_tokens, est_pages) = assist_estimate_inputs(&capability, &payload);
+        // dry_run: the full billing chain (estimate + rate card + receipt
+        // composition) with zero reservation, zero execution, zero
+        // consumption. The ONLY way to read a receipt shape without spending.
+        if crate::mcp::compute_dry_run(&raw) {
+            let estimate =
+                decentraai_compute::estimate_cost(&card, &capability, est_chars, est_max_tokens)
+                    .max(decentraai_compute::bill(&card, &capability, 0, 0, est_pages));
+            let (available, _) = state.quota_levels(account);
+            let id = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v.get("id").cloned())
+                .unwrap_or(serde_json::Value::Null);
+            let result_body = serde_json::json!({
+                "status": 200,
+                "ok": true,
+                "dry_run": true,
+                "capability": capability,
+                "explanation": "dry run: estimate only, nothing reserved or consumed",
+                "quota": {"reserved": false, "settled": false, "tokens_settled": 0},
+                "receipt": {
+                    "request_id": format!("cr-{}", &uuid::Uuid::new_v4().to_string()[..12]),
+                    "capability": capability,
+                    "model": "",
+                    "tokens": 0,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "pages": est_pages,
+                    "latency_ms": 0,
+                    "micro_cu_billed": estimate,
+                    "balance_after": available,
+                    "quota_consumed": 0,
+                    "dry_run": true,
+                    "rate_card_version": decentraai_compute::RATE_CARD_VERSION,
+                    "rate_card": {
+                        "version": card.version,
+                        "rounding": "ceil",
+                        "unit": "micro_cu",
+                        "embeddings_per_1k_in": card.embeddings_per_1k_in,
+                        "chat_per_500_out": card.chat_per_500_out,
+                        "chat_per_2k_in": card.chat_per_2k_in,
+                        "ocr_per_page": card.ocr_per_page,
+                    },
+                },
+                "body": serde_json::Value::Null,
+            });
+            return (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"content": [{"type": "text", "text": serde_json::to_string(&result_body).unwrap_or_default()}]}
+                }).to_string(),
+            )
+                .into_response();
+        }
+        // Rate limit applies to dry runs too (cheap, but not free).
+        if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
+            return e.into_response();
+        }
         // M16 gateway pipeline (dga_ only): pure authorize on the REQUESTED
         // capability → single-flight → fail-closed pre-audit.
         let gateway_agent = if is_gateway {
@@ -9498,9 +9592,6 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         } else {
             None
         };
-        if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
-            return e.into_response();
-        }
         let _gateway_flight = if is_gateway {
             if !state.gateway_try_claim(key_id, "decentraai_compute_request") {
                 return gateway_flight_denied();
@@ -9540,18 +9631,18 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         let estimate =
             decentraai_compute::estimate_cost(&card, &capability, est_chars, est_max_tokens)
                 .max(decentraai_compute::bill(&card, &capability, 0, 0, est_pages));
-        let spendable = state
+        let (spendable, reserved_now) = state
             .quota_ledger
             .as_ref()
             .and_then(|l| l.lock().unwrap().account(&account.to_string()))
-            .map(|a| a.available)
-            .unwrap_or(0);
+            .map(|a| (a.available, a.reserved))
+            .unwrap_or((0, 0));
         if estimate > spendable {
             let id = serde_json::from_str::<serde_json::Value>(&raw)
                 .ok()
                 .and_then(|v| v.get("id").cloned())
                 .unwrap_or(serde_json::Value::Null);
-            let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": format!("quota_exceeded: estimated cost {estimate} exceeds spendable {spendable}")}});
+            let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": format!("quota_exceeded: estimated cost {estimate} exceeds spendable (available {spendable}, reserved {reserved_now})")}});
             return (
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 serde_json::to_string(&body).unwrap_or_default(),
@@ -9561,13 +9652,23 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         // Receipt id: uuid only. (A previous revision leaked a Rust
         // `Instant` Debug dump into the id — stable opaque ids only.)
         let request_id = format!("cr-{}", &uuid::Uuid::new_v4().to_string()[..12]);
-        let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
-        {
+        // Reserve the estimate, not the whole balance: a stuck or abandoned
+        // handler can only ever hold dust, never the account.
+        let mut guard = match state.reserve_consumer_quota(
+            account,
+            key_id,
+            &request_id,
+            *quota_ceiling,
+            Some(estimate.max(1)),
+        ) {
             Ok(g) => g,
             Err(ReserveDeny::WindowExpired) => {
                 return forbidden("quota period expired for this key — renew_quota to extend it")
             }
-            Err(_) => return forbidden("no spendable quota for this consumer account"),
+            Err(_) => {
+                let (available, reserved) = state.quota_levels(account);
+                return ApiState::insufficient_quota(available, reserved);
+            }
         };
         let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
         let started = std::time::Instant::now();
@@ -9622,11 +9723,12 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         // from the same ledger snapshot so the two must agree. `tokens`
         // is the headline total; in/out split follows for chat/embeddings
         // (0/0 for ocr/pages and for unmeasured results).
-        // On failure the guard is dropped FIRST so the held reservation is
-        // released before the read — otherwise `balance_after` would show
-        // mid-hold state instead of the settled outcome.
+        // No executor (or any failure) settles, never merely releases:
+        // the request is accounted as a zero-bill settle so `settled` reads
+        // true and the outcome is auditable, while `quota_consumed` and
+        // token notes stay untouched (nothing measured, nothing charged).
         if !success {
-            drop(guard);
+            guard.settle(0);
         }
         let (balance_after, consumed_after) = state
             .quota_ledger
@@ -9655,6 +9757,8 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 "rate_card_version": decentraai_compute::RATE_CARD_VERSION,
                 "rate_card": {
                     "version": card.version,
+                    "rounding": "ceil",
+                    "unit": "micro_cu",
                     "embeddings_per_1k_in": card.embeddings_per_1k_in,
                     "chat_per_500_out": card.chat_per_500_out,
                     "chat_per_2k_in": card.chat_per_2k_in,
@@ -9740,13 +9844,16 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         // Quota reservation for this request (request_id from a monotonic
         // timestamp + key — idempotent across a retry of the same key+instant).
         let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
-        let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
+        let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling, None)
         {
             Ok(g) => g,
             Err(ReserveDeny::WindowExpired) => {
                 return forbidden("quota period expired for this key — renew_quota to extend it")
             }
-            Err(_) => return forbidden("no spendable quota for this consumer account"),
+            Err(_) => {
+                let (available, reserved) = state.quota_levels(account);
+                return ApiState::insufficient_quota(available, reserved);
+            }
         };
         // Execute through the existing fabric (decide→reserve→execute).
         let resp = run_execute_decision(state, &args).await;
@@ -14985,7 +15092,7 @@ async fn governor_execute_handler(
                     .map(|d| d.as_nanos())
                     .unwrap_or(0)
             );
-            match state.reserve_consumer_quota(account, key_id, &rid, *quota_ceiling) {
+            match state.reserve_consumer_quota(account, key_id, &rid, *quota_ceiling, None) {
                 Ok(g) => Some(g),
                 Err(ReserveDeny::WindowExpired) => {
                     return forbidden("quota period expired for this key — renew_quota to extend it")
@@ -18656,7 +18763,7 @@ async fn proxy_with_auth(
             // reservation and consume without any accounting. Unique per
             // request => each request reserves and settles on its own.
             let request_tag = format!("{}:{:?}", uri, std::time::Instant::now());
-            match state.reserve_consumer_quota(account, key_id, &request_tag, *quota_ceiling) {
+            match state.reserve_consumer_quota(account, key_id, &request_tag, *quota_ceiling, None) {
                 Ok(guard) => Some(guard),
                 // A lapsed quota window is denied distinctly from an empty
                 // account (separate stable type so readers can tell them apart).
@@ -18669,15 +18776,18 @@ async fn proxy_with_auth(
                     )
                         .into_response();
                 }
-                // A classified consumer key with no spendable quota is denied.
+                // A classified consumer key with no spendable quota is denied,
+                // with the live breakdown so "parked" never reads as absent.
                 // (NoLedger also lands here, but a consumer key can
                 // only authenticate when the ledger is wired — see classify.)
                 Err(_) => {
+                    let (available, reserved) = state.quota_levels(account);
                     return (
                         StatusCode::FORBIDDEN,
                         [(header::CONTENT_TYPE, "application/json")],
-                        "{\"error\":{\"message\":\"no spendable quota for this consumer account\",\"type\":\"insufficient_quota\"}}"
-                            .to_string(),
+                        format!(
+                            "{{\"error\":{{\"message\":\"insufficient_quota: no spendable quota (available {available}, reserved {reserved})\",\"type\":\"insufficient_quota\"}}}}"
+                        ),
                     )
                         .into_response();
                 }
@@ -27115,7 +27225,7 @@ mod tests {
             state
         };
         let guard = state
-            .reserve_consumer_quota("acct", "key-1", "req-1", 50)
+            .reserve_consumer_quota("acct", "key-1", "req-1", 50, None)
             .expect("has quota");
         // Simulate a failed request: drop the guard without settling.
         drop(guard);
