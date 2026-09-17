@@ -1729,6 +1729,7 @@ async fn openapi_handler() -> Response {
             "/v1/auth/wallet/network": { "get": { "operationId": "walletNetwork", "summary": "Server chain binding for wallet onboarding", "responses": { "200": { "description": "Network" } } } },
             "/v1/auth/wallet/blockhash": { "get": { "operationId": "walletBlockhash", "summary": "Fresh block hash for native-auth token minting", "responses": { "200": { "description": "Block hash" } } } },
             "/v1/hub/settle/{task_id}": { "get": { "operationId": "hubSettleReceipt", "summary": "Authoritative settlement receipt (winners, ledger proof, evidence preimage, deliverable)", "responses": { "200": { "description": "Receipt" }, "404": { "description": "Unknown task" } } } },
+            "/v1/agent/pass": { "post": { "operationId": "agentPass", "summary": "Autopilot tick as a pure read-only projection (operator+): planned actions, never executed; dry_run must be true", "responses": { "200": { "description": "Tick plan" }, "400": { "description": "Bad body or dry_run false" }, "403": { "description": "Forbidden for client tokens" } } } },
             "/openapi.json": { "get": { "operationId": "openapi", "summary": "This document", "responses": { "200": { "description": "OpenAPI spec" } } } },
             "/sse": { "get": { "operationId": "fabricStream", "summary": "Multiplexed SSE feed (hub + arena events)", "responses": { "200": { "description": "text/event-stream" } } } }
         }
