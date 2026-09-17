@@ -6253,6 +6253,72 @@ fn agent_pass_plan(hub: &decentraai_agent_hub::HubState) -> Vec<serde_json::Valu
         .collect()
 }
 
+/// Upper-bound billing inputs extracted from an assist REQUEST (before
+/// execution), for the over-quota pre-check. Input tokens are upper-bounded
+/// by input chars; output by the requested `max_tokens` (1024 fallback);
+/// ocr pages default to 1. Pure and total over any JSON shape.
+fn assist_estimate_inputs(
+    capability: &str,
+    payload: &serde_json::Value,
+) -> (u64, u64, u64) {
+    match capability {
+        "embeddings" => (payload.get("input").and_then(|v| v.as_str()).map(|s| s.chars().count() as u64).unwrap_or(0), 0, 0),
+        "chat" | "text_generation" => {
+            let chars = payload
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().count() as u64)
+                .or_else(|| {
+                    payload.get("messages").and_then(|v| v.as_array()).map(|ms| {
+                        ms.iter()
+                            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+                            .map(|s| s.chars().count() as u64)
+                            .sum()
+                    })
+                })
+                .or_else(|| {
+                    payload
+                        .get("input")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.chars().count() as u64)
+                })
+                .unwrap_or(0);
+            let max_tokens = payload.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(1024);
+            (chars, max_tokens, 0)
+        }
+        "ocr" => (
+            0,
+            0,
+            payload.get("pages").and_then(|v| v.as_u64()).unwrap_or(1).max(1),
+        ),
+        _ => (0, 0, 0),
+    }
+}
+
+/// Measured usage extracted from an assist RESULT (after execution).
+/// Returns `None` when the worker returned no `usage` object — absent
+/// stays absent (no billing, no token notes). Otherwise (in, out, model);
+/// `model` is `""` when the backend did not name one.
+fn assist_measured_usage(
+    result: &serde_json::Value,
+) -> Option<(u64, u64, String)> {
+    let usage = result.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
+    let tokens_in = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let tokens_out = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let model = result
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((tokens_in, tokens_out, model))
+}
+
 fn extract_tool_name(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     if v.get("method")?.as_str()? == "tools/call" {
@@ -9466,7 +9532,33 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         if peers.is_empty() {
             return forbidden("no connected workers for compute assist");
         }
-        let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
+        // Over-quota pre-check (billing): refuse with a stable error BEFORE
+        // reserving when even the upper-bound estimate exceeds spendable.
+        // Nothing is reserved, nothing is charged on this path.
+        let card = decentraai_compute::RateCard::v1();
+        let (est_chars, est_max_tokens, est_pages) = assist_estimate_inputs(&capability, &payload);
+        let estimate =
+            decentraai_compute::estimate_cost(&card, &capability, est_chars, est_max_tokens)
+                .max(decentraai_compute::bill(&card, &capability, 0, 0, est_pages));
+        let spendable = state
+            .quota_ledger
+            .as_ref()
+            .and_then(|l| l.lock().unwrap().account(&account.to_string()))
+            .map(|a| a.available)
+            .unwrap_or(0);
+        if estimate > spendable {
+            let id = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v.get("id").cloned())
+                .unwrap_or(serde_json::Value::Null);
+            let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": format!("quota_exceeded: estimated cost {estimate} exceeds spendable {spendable}")}});
+            return (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response();
+        }
+        let request_id = format!("cr-{}-{:?}", &uuid::Uuid::new_v4().to_string()[..12], std::time::Instant::now());
         let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
         {
             Ok(g) => g,
@@ -9476,6 +9568,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             Err(_) => return forbidden("no spendable quota for this consumer account"),
         };
         let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        let started = std::time::Instant::now();
         let (success, result_payload, explanation) = crate::intel_assist::run_assist_request(
             &p2p,
             peers,
@@ -9488,12 +9581,32 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             lease_secs,
         )
         .await;
+        let latency_ms = started.elapsed().as_millis() as u64;
         let result_json: serde_json::Value =
             serde_json::from_slice(&result_payload).unwrap_or(serde_json::Value::Null);
+        // Metered billing (§7 compute): measured usage only. Absent usage
+        // bills 0 and notes nothing (absent stays absent); the stub era's
+        // settle(1) is gone — `tokens_settled` below now carries the real
+        // billed amount (announced value fix, same key).
+        let ocr_pages = if capability == "ocr" { est_pages } else { 0 };
+        let (tokens_in, tokens_out, model, pages) = match assist_measured_usage(&result_json) {
+            Some((tin, tout, m)) => (tin, tout, m, ocr_pages),
+            None => (0, 0, String::new(), ocr_pages),
+        };
+        let billed = if success {
+            decentraai_compute::bill(&card, &capability, tokens_in, tokens_out, pages)
+        } else {
+            0
+        };
         if success {
-            guard.settle(1);
-            // Unit stub count for a completed assist, not measured tokens.
-            state.note_token_usage(auth, 1, TokenSource::Estimated);
+            guard.settle(billed);
+            if tokens_in + tokens_out > 0 {
+                state.note_token_usage(
+                    auth,
+                    tokens_in.saturating_add(tokens_out),
+                    TokenSource::Measured,
+                );
+            }
         }
         // M16 gateway outcome record (best-effort — the gate already held).
         if is_gateway {
@@ -9503,12 +9616,43 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 serde_json::json!({"key_id": key_id, "tool": "decentraai_compute_request", "ok": success}),
             );
         }
+        // Receipt (§7 compute): the bill and the balance it landed on, read
+        // from the same ledger snapshot so the two must agree. `tokens`
+        // is the headline total; in/out split follows for chat/embeddings
+        // (0/0 for ocr/pages and for unmeasured results).
+        let (balance_after, consumed_after) = state
+            .quota_ledger
+            .as_ref()
+            .and_then(|l| l.lock().unwrap().account(&account.to_string()))
+            .map(|a| (a.available, a.consumed))
+            .unwrap_or((0, 0));
         let result_body = serde_json::json!({
             "status": if success { 200 } else { 502 },
             "ok": success,
             "capability": capability,
             "explanation": explanation,
-            "quota": {"reserved": true, "settled": success, "tokens_settled": if success {1} else {0}},
+            "quota": {"reserved": true, "settled": success, "tokens_settled": if success {billed} else {0}},
+            "receipt": {
+                "request_id": request_id,
+                "capability": capability,
+                "model": model,
+                "tokens": tokens_in.saturating_add(tokens_out),
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "pages": pages,
+                "latency_ms": latency_ms,
+                "micro_cu_billed": billed,
+                "balance_after": balance_after,
+                "quota_consumed": consumed_after,
+                "rate_card_version": decentraai_compute::RATE_CARD_VERSION,
+                "rate_card": {
+                    "version": card.version,
+                    "embeddings_per_1k_in": card.embeddings_per_1k_in,
+                    "chat_per_500_out": card.chat_per_500_out,
+                    "chat_per_2k_in": card.chat_per_2k_in,
+                    "ocr_per_page": card.ocr_per_page,
+                },
+            },
             "body": result_json,
         });
         let id = serde_json::from_str::<serde_json::Value>(&raw)
@@ -19432,6 +19576,29 @@ mod tests {
         assert!(!anchor_is_sim_linked(&contracts, &anchor(None)));
         // Linked to missing contract: counts (cannot prove sim).
         assert!(!anchor_is_sim_linked(&contracts, &anchor(Some("ct-x"))));
+    }
+
+    #[test]
+    fn assist_estimate_and_usage_helpers() {
+        // Estimate upper-bounds from request shapes.
+        let (chars, max_tokens, _) = assist_estimate_inputs(
+            "chat",
+            &serde_json::json!({"prompt": "hi", "max_tokens": 64}),
+        );
+        assert_eq!((chars, max_tokens), (2, 64));
+        let (chars, _, _) = assist_estimate_inputs(
+            "chat",
+            &serde_json::json!({"messages": [{"role": "user", "content": "abc"}]}),
+        );
+        assert_eq!(chars, 3);
+        // Measured usage parses backend usage objects; absent stays absent.
+        let r = serde_json::json!({"model": "m.gguf", "usage": {"prompt_tokens": 10, "completion_tokens": 5}});
+        assert_eq!(
+            assist_measured_usage(&r),
+            Some((10, 5, "m.gguf".to_string()))
+        );
+        assert_eq!(assist_measured_usage(&serde_json::json!({"model": "m"})), None);
+        assert_eq!(assist_measured_usage(&serde_json::json!({})), None);
     }
 
     #[test]

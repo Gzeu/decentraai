@@ -39,6 +39,7 @@
 
 pub mod assist;
 pub mod availability;
+pub mod billing;
 pub mod capability;
 pub mod compensation;
 pub mod contribution;
@@ -61,6 +62,7 @@ pub mod scheduler;
 pub(crate) mod testutil;
 
 pub use availability::{ComputeAdvertisement, ComputeAvailability, WorkerHealth};
+pub use billing::{RATE_CARD_VERSION, RateCard, bill, estimate_cost};
 pub use capability::{ComputeCapability, GpuSpec, ServedModel};
 pub use compensation::{
     CompensationAccount, CompensationEvent, CompensationLedger, RewardPolicy, reward_tokens,

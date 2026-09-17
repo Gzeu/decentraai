@@ -911,7 +911,7 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "decentraai_compute_request",
-            description: "Request remote compute assistance (L1 ASSIST, Sharing is Caring DFCP). Requires a consumer key with 'compute' or matching capability scope. The fabric planner decides the worker; the caller never selects a peer. Rate-limited, quota-gated, audited.",
+            description: "Request remote compute assistance (L1 ASSIST, Sharing is Caring DFCP). Requires a consumer key with 'compute' or matching capability scope. The fabric planner decides the worker; the caller never selects a peer. Rate-limited, quota-gated, audited. Metered billing (§7): the response nests a receipt {request_id, capability, model, tokens, tokens_in/out, latency_ms, micro_cu_billed, balance_after, rate_card_version, rate_card} billed from measured usage under the versioned rate card; over-quota calls are refused with quota_exceeded and charge nothing.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
