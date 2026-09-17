@@ -6442,6 +6442,46 @@ fn compute_receipt(
     })
 }
 
+/// Best-effort onboarding label for `discover_capabilities`: the scope a
+/// tool needs, or "operator" for role-gated tools no consumer key can ever
+/// call (proven by the denial test), or "none". The AUTHORITATIVE scopes
+/// live in `requiredScopes` on tools/list. Pure so tests pin it.
+fn discover_required_scope(name: &str) -> &'static str {
+    match name {
+        "decide" | "execute_decision" => "none",
+        "decentraai_embeddings" => "embeddings",
+        "decentraai_compute_request" => "compute",
+        "list_workers" | "list_sessions" | "get_quota" | "list_consumer_keys"
+        | "list_executions" => "operator",
+        "hub_publish_task"
+        | "hub_place_bid"
+        | "hub_propose"
+        | "hub_decide_proposal"
+        | "hub_form_team"
+        | "hub_execute"
+        | "hub_state" => "hub",
+        "society_state"
+        | "society_trust"
+        | "society_reputation"
+        | "society_relationships"
+        | "society_contributions"
+        | "society_outcomes"
+        | "society_decision_hints" => "society",
+        "agent_memory_read"
+        | "agent_memory_search"
+        | "agent_memory_snapshot"
+        | "agent_memory_export"
+        | "agent_memory_write"
+        | "memory_list_scopes"
+        | "memory_read_entries"
+        | "memory_write_entry" => "memory",
+        "arena_state" | "arena_act" => "arena",
+        "get_revenue" | "get_escrow_verdicts" | "get_anchor_coverage" | "list_agent_anchors"
+        | "renew_quota" => "economy",
+        _ => "none",
+    }
+}
+
 fn extract_tool_name(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     if v.get("method")?.as_str()? == "tools/call" {
@@ -11785,39 +11825,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             // per-tool scopes live in `requiredScopes` on tools/list.
             // "operator" below means role-gated: no consumer key can ever
             // call it, regardless of scopes (proven by the denial test).
-            let required_scope = match name {
-                "decide" | "execute_decision" => "none",
-                "decentraai_embeddings" => "embeddings",
-                "decentraai_compute_request" => "compute",
-                "list_workers" | "list_sessions" | "get_quota" | "list_consumer_keys"
-                | "list_executions" => "operator",
-                "hub_publish_task"
-                | "hub_place_bid"
-                | "hub_propose"
-                | "hub_decide_proposal"
-                | "hub_form_team"
-                | "hub_execute"
-                | "hub_state" => "hub",
-                "society_state"
-                | "society_trust"
-                | "society_reputation"
-                | "society_relationships"
-                | "society_contributions"
-                | "society_outcomes"
-                | "society_decision_hints" => "society",
-                "agent_memory_read"
-                | "agent_memory_search"
-                | "agent_memory_snapshot"
-                | "agent_memory_export"
-                | "agent_memory_write"
-                | "memory_list_scopes"
-                | "memory_read_entries"
-                | "memory_write_entry" => "memory",
-                "arena_state" | "arena_act" => "arena",
-                "get_revenue" | "get_escrow_verdicts" | "get_anchor_coverage" | "list_agent_anchors"
-                | "renew_quota" => "economy",
-                _ => "none",
-            };
+            let required_scope = discover_required_scope(name);
             capabilities.insert(
                 name.to_string(),
                 serde_json::json!({
@@ -19907,6 +19915,17 @@ mod tests {
         );
         assert_eq!(assist_measured_usage(&serde_json::json!({"model": "m"})), None);
         assert_eq!(assist_measured_usage(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn discover_required_scope_names_role_gates_honestly() {
+        assert_eq!(discover_required_scope("list_workers"), "operator");
+        assert_eq!(discover_required_scope("list_sessions"), "operator");
+        assert_eq!(discover_required_scope("get_quota"), "operator");
+        assert_eq!(discover_required_scope("list_consumer_keys"), "operator");
+        assert_eq!(discover_required_scope("list_executions"), "operator");
+        assert_eq!(discover_required_scope("get_revenue"), "economy");
+        assert_eq!(discover_required_scope("decide"), "none");
     }
 
     #[test]
