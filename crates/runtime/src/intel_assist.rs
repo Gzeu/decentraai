@@ -74,13 +74,23 @@ impl AssistWorkerState {
         embeddings_backend_url: Option<String>,
         trusted_peers: Vec<String>,
     ) -> Self {
+        // Bounded HTTP: a short CONNECT timeout fails dead backends fast
+        // (no hanging on TCP-timeout variance), while a long TOTAL timeout
+        // never kills slow-but-healthy generations (CPU inference can take
+        // minutes; leases bound the work, not the socket). Builder failure
+        // falls back to an unconfigured client rather than failing startup.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             limits,
             backend_url: Arc::new(std::sync::RwLock::new(backend_url)),
             embeddings_backend_url: embeddings_backend_url
                 .filter(|u| !u.is_empty())
                 .map(|u| Arc::new(std::sync::RwLock::new(u))),
-            http: reqwest::Client::new(),
+            http,
             leases: Mutex::new(HashMap::new()),
             offers_sent: Mutex::new(HashMap::new()),
             trusted_peers: Arc::new(std::sync::RwLock::new(trusted_peers)),

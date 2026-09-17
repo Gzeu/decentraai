@@ -6349,6 +6349,41 @@ fn assist_measured_usage(
     Some((tokens_in, tokens_out, model))
 }
 
+/// Merges connected peers + measured network links into ONE homogeneous
+/// object array (a ragged string|object mix broke uniform readers, and
+/// duplicated peers present in both sources). One entry per peer id:
+/// `{peer, connected, measured, rtt_ms, bandwidth_mbps, locality}` —
+/// link fields are null when unmeasured (absent stays absent; a measured
+/// zero stays zero). Deterministic id order. Pure.
+fn merge_peer_views(
+    connected: &[String],
+    links: &std::collections::BTreeMap<String, (u32, u32, String)>,
+) -> serde_json::Value {
+    let mut ids: Vec<&String> = connected.iter().collect();
+    for peer in links.keys() {
+        if !ids.contains(&peer) {
+            ids.push(peer);
+        }
+    }
+    ids.sort();
+    let connected_set: std::collections::HashSet<&String> = connected.iter().collect();
+    serde_json::Value::Array(
+        ids.into_iter()
+            .map(|id| {
+                let link = links.get(id);
+                serde_json::json!({
+                    "peer": id,
+                    "connected": connected_set.contains(id),
+                    "measured": link.is_some(),
+                    "rtt_ms": link.map(|l| l.0),
+                    "bandwidth_mbps": link.map(|l| l.1),
+                    "locality": link.map(|l| l.2.clone()),
+                })
+            })
+            .collect(),
+    )
+}
+
 fn extract_tool_name(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     if v.get("method")?.as_str()? == "tools/call" {
@@ -8126,7 +8161,55 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
     } else if let Some((capability, payload, lease_secs)) =
         crate::mcp::compute_request(&raw)
     {
-        let result = match &state.p2p {
+        // Operator dry_run parity: same estimate receipt as the consumer
+        // path, without executing. Without this, a caller probing with an
+        // operator key triggers REAL remote work while a consumer key gets
+        // an estimate — a safety asymmetry, not just asymmetry. Operator
+        // holds no quota account, so balance fields read 0 under dry_run.
+        if crate::mcp::compute_dry_run(&raw) {
+            let card = decentraai_compute::RateCard::v1();
+            let (est_chars, est_max_tokens, est_pages) =
+                assist_estimate_inputs(&capability, &payload);
+            let estimate =
+                decentraai_compute::estimate_cost(&card, &capability, est_chars, est_max_tokens)
+                    .max(decentraai_compute::bill(&card, &capability, 0, 0, est_pages));
+            let request_id =
+                format!("cr-{}", &uuid::Uuid::new_v4().to_string()[..12]);
+            ctx.compute_result = serde_json::json!({
+                "status": 200,
+                "ok": true,
+                "dry_run": true,
+                "capability": capability,
+                "explanation": "dry run: estimate only, nothing reserved or consumed",
+                "quota": {"reserved": false, "settled": false, "tokens_settled": 0},
+                "receipt": {
+                    "request_id": request_id,
+                    "capability": capability,
+                    "model": "",
+                    "tokens": 0,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "pages": est_pages,
+                    "latency_ms": 0,
+                    "micro_cu_billed": estimate,
+                    "balance_after": 0,
+                    "quota_consumed": 0,
+                    "dry_run": true,
+                    "rate_card_version": decentraai_compute::RATE_CARD_VERSION,
+                    "rate_card": {
+                        "version": card.version,
+                        "rounding": "ceil",
+                        "unit": "micro_cu",
+                        "embeddings_per_1k_in": card.embeddings_per_1k_in,
+                        "chat_per_500_out": card.chat_per_500_out,
+                        "chat_per_2k_in": card.chat_per_2k_in,
+                        "ocr_per_page": card.ocr_per_page,
+                    },
+                },
+                "body": serde_json::Value::Null,
+            });
+        } else {
+            let result = match &state.p2p {
             Some(p2p) => {
                 let peers = p2p.connected_peers().await;
                 if peers.is_empty() {
@@ -8161,6 +8244,7 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
             None => serde_json::json!({"error": "p2p not attached for compute assist"}),
         };
         ctx.compute_result = result;
+        }
     } else if let Some((stages_v, total, cap)) =
         crate::mcp::orchestrate_propose_request(&raw)
     {
@@ -11980,10 +12064,14 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 });
             }
         }
+    } else if crate::mcp::rate_card_request(&raw) {
+        // Precomputed in mcp_context for every caller; public market data
+        // (no scope gate by design). Empty arm: falls through to the
+        // generic dispatch below, which serves ctx.rate_card.
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), m18_* tools (economy scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), get_anchor_coverage (economy scope), list_agent_anchors (economy scope), renew_quota (economy scope), announce_demand (no scope), list_demands (no scope), cancel_demand (no scope), or discover_capabilities (no scope)",
+            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), m18_* tools (economy scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), get_anchor_coverage (economy scope), list_agent_anchors (economy scope), renew_quota (economy scope), get_rate_card (no scope), announce_demand (no scope), list_demands (no scope), cancel_demand (no scope), or discover_capabilities (no scope)",
         );
     }
 
@@ -12064,31 +12152,39 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         .await
         .unwrap_or_else(|| serde_json::json!({ "data": [] }));
 
-    // Peers + measured network links.
-    let mut peers = serde_json::Value::Array(Vec::new());
-    if let Some(p2p) = &state.p2p {
-        let snapshot = p2p.peers_snapshot().await;
-        peers = serde_json::json!(
-            snapshot
+    // Peers + measured network links, homogeneous objects only (never a
+    // ragged string|object mix, never duplicated ids across sources).
+    let peers = {
+        let connected: Vec<String> = match &state.p2p {
+            Some(p2p) => p2p
+                .peers_snapshot()
+                .await
                 .connected
                 .iter()
                 .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-        );
-    }
-    if let Some(compute) = &state.compute {
-        let graph = compute.network_graph();
-        if let Some(arr) = peers.as_array_mut() {
-            for (peer, link) in graph.peers() {
-                arr.push(serde_json::json!({
-                    "peer": peer,
-                    "rtt_ms": link.rtt_us / 1000,
-                    "bandwidth_mbps": link.bandwidth_mbps,
-                    "locality": format!("{:?}", link.locality),
-                }));
-            }
-        }
-    }
+                .collect(),
+            None => Vec::new(),
+        };
+        let links: std::collections::BTreeMap<String, (u32, u32, String)> =
+            match &state.compute {
+                Some(compute) => compute
+                    .network_graph()
+                    .peers()
+                    .map(|(peer, link)| {
+                        (
+                            peer.clone(),
+                            (
+                                link.rtt_us / 1000,
+                                link.bandwidth_mbps,
+                                format!("{:?}", link.locality),
+                            ),
+                        )
+                    })
+                    .collect(),
+                None => std::collections::BTreeMap::new(),
+            };
+        merge_peer_views(&connected, &links)
+    };
 
     McpContext {
         status,
@@ -12286,6 +12382,19 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         demand_result: serde_json::json!({}),
         // Quota renewal (auto): empty until the handler populates it.
         renew_result: serde_json::json!({}),
+        // Billing rate card (§7 compute): static snapshot, both paths.
+        rate_card: {
+            let card = decentraai_compute::RateCard::v1();
+            serde_json::json!({
+                "version": card.version,
+                "rounding": "ceil",
+                "unit": "micro_cu",
+                "embeddings_per_1k_in": card.embeddings_per_1k_in,
+                "chat_per_500_out": card.chat_per_500_out,
+                "chat_per_2k_in": card.chat_per_2k_in,
+                "ocr_per_page": card.ocr_per_page,
+            })
+        },
     }
 }
 
@@ -19720,6 +19829,29 @@ mod tests {
         );
         assert_eq!(assist_measured_usage(&serde_json::json!({"model": "m"})), None);
         assert_eq!(assist_measured_usage(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn merge_peer_views_is_homogeneous_deduped_and_ordered() {
+        use std::collections::BTreeMap;
+        let connected = vec!["p-b".to_string(), "p-a".to_string()];
+        let mut links = BTreeMap::new();
+        links.insert("p-a".to_string(), (10u32, 100u32, "Lan".to_string()));
+        links.insert("p-ghost".to_string(), (20u32, 0u32, "Wan".to_string()));
+        let out = merge_peer_views(&connected, &links);
+        let arr = out.as_array().unwrap();
+        // Homogeneous objects, deterministic id order, no duplicates.
+        assert_eq!(arr.len(), 3);
+        assert!(arr.iter().all(|e| e.is_object()));
+        assert_eq!(arr[0]["peer"], "p-a");
+        assert_eq!(arr[1]["peer"], "p-b");
+        assert_eq!(arr[2]["peer"], "p-ghost");
+        assert_eq!(arr[0]["connected"], true);
+        assert_eq!(arr[0]["measured"], true);
+        assert_eq!(arr[0]["rtt_ms"], 10);
+        assert_eq!(arr[1]["measured"], false);
+        assert_eq!(arr[1]["rtt_ms"], serde_json::Value::Null);
+        assert_eq!(arr[2]["connected"], false);
     }
 
     #[test]

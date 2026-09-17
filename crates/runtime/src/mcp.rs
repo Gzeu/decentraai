@@ -140,6 +140,8 @@ pub struct McpContext {
     pub demand_result: Value,
     /// Quota renewal (auto): result of last `renew_quota` call.
     pub renew_result: Value,
+    /// Billing rate card snapshot (§7 compute): versioned rates, read-only.
+    pub rate_card: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -242,6 +244,8 @@ pub fn required_scopes_for(tool_name: &str) -> &'static [&'static str] {
         | "memory_list_conflicts" | "memory_resolve_conflict" => &["memory"],
         // Arena scope
         "arena_state" | "arena_act" => &["arena"],
+        // Rate card is public market data (like discover_capabilities).
+        "get_rate_card" => &[],
         // Revenue/economy scope
         "get_revenue" | "get_escrow_verdicts" | "get_anchor_coverage" | "list_agent_anchors" => {
             &["economy"]
@@ -334,6 +338,12 @@ pub fn all_tools() -> Vec<ToolDef> {
             annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
+            name: "get_rate_card",
+            description: "Billing rate card (§7 compute): versioned micro-CU rates per capability with rounding rule and unit. Read-only; predict any receipt offline as ceil(tokens_in/quantum)*rate + ceil(tokens_out/quantum)*rate. The same object is echoed in every compute receipt.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
             name: "renew_quota",
             description: "Renew a consumer key's quota window: converts the owner account's already-earned-but-unspent compensation into spendable quota (never net-new value) and extends the key's quota period. Mutating: commits two ledgers plus the key registry atomically. Unknown keys are refused with a stable error and create nothing.",
             input_schema: json!({
@@ -396,7 +406,7 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_peers",
-            description: "Connected P2P peers and measured network links (RTT, bandwidth, locality).",
+            description: "Connected P2P peers and measured network links as a homogeneous object array [{peer, connected, measured, rtt_ms, bandwidth_mbps, locality}] (null link fields when unmeasured; deterministic id order).",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         annotations: ToolAnnotations::read_only(),
         },
@@ -1634,6 +1644,21 @@ pub fn quota_request(raw: &str) -> bool {
         == Some("get_quota")
 }
 
+/// Whether the incoming message is a `get_rate_card` tool call. Pure —
+/// served from the precomputed snapshot in [`McpContext::rate_card`].
+pub fn rate_card_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("get_rate_card")
+}
+
 /// Whether the incoming message is a `get_revenue` tool call. Pure —
 /// lets the HTTP layer precompute the revenue snapshot into [`McpContext::revenue`].
 pub fn revenue_request(raw: &str) -> bool {
@@ -2824,10 +2849,10 @@ pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
                     });
                     // §1.2: machine-readable scope requirements so clients
                     // can badge tools accurately without parsing error text.
+                    // Always emitted (even empty): absent would be ambiguous
+                    // between "no scope needed" and "old server".
                     let scopes = required_scopes_for(t.name);
-                    if !scopes.is_empty() {
-                        tool_json["requiredScopes"] = json!(scopes);
-                    }
+                    tool_json["requiredScopes"] = json!(scopes);
                     tool_json
                 })
                 .collect::<Vec<_>>()
@@ -2893,6 +2918,8 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "get_quota" => &ctx.quota,
         "get_compensation" => &ctx.compensation,
         "get_revenue" => &ctx.revenue,
+        // Rate card (§7 compute): precomputed snapshot, both paths.
+        "get_rate_card" => &ctx.rate_card,
         // Quota renewal (auto): populated per-request (needs key_id).
         "renew_quota" => &ctx.renew_result,
         // §1 Demand tools
@@ -3030,6 +3057,7 @@ mod tests {
             revenue: json!({}),
             demand_result: json!({}),
             renew_result: json!({}),
+            rate_card: json!({}),
         }
     }
 
@@ -4167,6 +4195,25 @@ mod tests {
         );
         let missing = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"renew_quota","arguments":{}}}"#;
         assert!(renew_quota_request(missing).is_none());
+    }
+
+    #[test]
+    fn rate_card_request_matches_only_the_tool() {
+        assert!(rate_card_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_rate_card","arguments":{}}}"#
+        ));
+        assert!(!rate_card_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_revenue","arguments":{}}}"#
+        ));
+    }
+
+    #[test]
+    fn tools_list_exposes_get_rate_card_as_public_read() {
+        let r = call(r#"{"jsonrpc":"2.0","id":17,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let t = tools.iter().find(|t| t["name"] == "get_rate_card").unwrap();
+        assert_eq!(t.get("requiredScopes").cloned(), Some(json!([])));
+        assert_eq!(t["annotations"]["readOnlyHint"], true);
     }
 
     #[test]
