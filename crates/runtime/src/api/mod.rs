@@ -11327,7 +11327,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), get_anchor_coverage (economy scope), list_agent_anchors (economy scope), or discover_capabilities (no scope)",
+            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), get_anchor_coverage (economy scope), list_agent_anchors (economy scope), announce_demand (no scope), list_demands (no scope), cancel_demand (no scope), or discover_capabilities (no scope)",
         );
     }
 
