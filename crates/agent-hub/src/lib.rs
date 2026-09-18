@@ -43,6 +43,68 @@ pub struct HubTask {
     /// execute time. Binds the settlement to an artifact for passports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliverable_hash: Option<String>,
+    /// Optional evolution anchor (artifact/parent/bench hashes) bound at
+    /// execute time. Turns a client-side generation ledger into a public
+    /// chain anchored in the fabric. Absent if no evolution field was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evolution: Option<EvolutionTag>,
+}
+
+/// Evolution anchor carried on a settled task's receipt. Each hash is a
+/// 64-hex digest over the canonical preimage (§BACKEND_EVOLUTION.md §2/§11);
+/// `*_alg` defaults to `blake3-256`. Only hash fields actually sent are
+/// present, so receipts stay additive (no empty `{}` when nothing was sent).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvolutionTag {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_alg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_alg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_alg: Option<String>,
+}
+
+impl EvolutionTag {
+    /// Build a block from raw optional args, defaulting each `*_alg` to
+    /// `blake3-256` when its hash is present. Returns `None` when no hash
+    /// field was provided, so the receipt never carries an empty block.
+    pub fn from_args(
+        artifact_hash: Option<String>,
+        artifact_alg: Option<String>,
+        parent_hash: Option<String>,
+        parent_alg: Option<String>,
+        bench_hash: Option<String>,
+        bench_alg: Option<String>,
+    ) -> Option<EvolutionTag> {
+        if artifact_hash.is_none() && parent_hash.is_none() && bench_hash.is_none() {
+            return None;
+        }
+        Some(EvolutionTag {
+            artifact_hash: artifact_hash.clone(),
+            artifact_alg: artifact_hash
+                .is_some()
+                .then(|| artifact_alg.unwrap_or_else(|| "blake3-256".to_string())),
+            parent_hash: parent_hash.clone(),
+            parent_alg: parent_hash
+                .is_some()
+                .then(|| parent_alg.unwrap_or_else(|| "blake3-256".to_string())),
+            bench_hash: bench_hash.clone(),
+            bench_alg: bench_hash
+                .is_some()
+                .then(|| bench_alg.unwrap_or_else(|| "blake3-256".to_string())),
+        })
+    }
+
+    /// True when any hash field is present (the block is non-empty).
+    pub fn is_present(&self) -> bool {
+        self.artifact_hash.is_some() || self.parent_hash.is_some() || self.bench_hash.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +261,7 @@ impl HubState {
             evidence_id: None,
             settled_by: None,
             deliverable_hash: None,
+            evolution: None,
         };
         self.tasks.insert(id.clone(), task.clone());
         self.push_event(
@@ -436,12 +499,36 @@ impl HubState {
         tick: u64,
         deliverable_hash: Option<String>,
     ) {
+        self.record_settlement_with_evolution(
+            task_id,
+            evidence_id,
+            actor,
+            tick,
+            deliverable_hash,
+            None,
+        );
+    }
+
+    /// Like [`record_settlement`], but also binds an optional [`EvolutionTag`]
+    /// to the settled task, anchoring a client generation ledger in the fabric.
+    pub fn record_settlement_with_evolution(
+        &mut self,
+        task_id: &str,
+        evidence_id: String,
+        actor: String,
+        tick: u64,
+        deliverable_hash: Option<String>,
+        evolution: Option<EvolutionTag>,
+    ) {
         if let Some(t) = self.tasks.get_mut(task_id) {
             t.status = TaskStatus::Settled;
             t.settled_tick = Some(tick);
             t.evidence_id = Some(evidence_id.clone());
             t.settled_by = Some(actor);
             t.deliverable_hash = deliverable_hash;
+            if evolution.is_none() || evolution.as_ref().is_some_and(|e| e.is_present()) {
+                t.evolution = evolution;
+            }
         }
         self.push_event(
             "settlement_done",
@@ -555,6 +642,73 @@ mod tests {
         let ev = hub.events.back().unwrap();
         assert_eq!(ev.kind, "settlement_done");
         assert_eq!(ev.evidence_id.as_deref(), Some("ev123"));
+    }
+
+    #[test]
+    fn record_settlement_with_evolution_binds_anchor() {
+        let mut hub = HubState::new();
+        let task = hub.publish_task("alice".into(), "t".into(), "d".into(), 100, None);
+        let dh = "ab".repeat(32);
+        let art = "11".repeat(32);
+        let par = "22".repeat(32);
+        let ben = "33".repeat(32);
+        let evo = EvolutionTag::from_args(
+            Some(art.clone()),
+            None,
+            Some(par.clone()),
+            None,
+            Some(ben.clone()),
+            None,
+        )
+        .expect("all three hashes present");
+        hub.record_settlement_with_evolution(
+            &task.id,
+            "ev123".into(),
+            "bob".into(),
+            7,
+            Some(dh),
+            Some(evo),
+        );
+        let t = hub.tasks.get(&task.id).unwrap();
+        let bound = t.evolution.as_ref().expect("evolution anchored");
+        assert_eq!(bound.artifact_hash.as_deref(), Some(art.as_str()));
+        assert_eq!(bound.parent_hash.as_deref(), Some(par.as_str()));
+        assert_eq!(bound.bench_hash.as_deref(), Some(ben.as_str()));
+        // *_alg defaults to blake3-256 when hash present.
+        assert_eq!(bound.artifact_alg.as_deref(), Some("blake3-256"));
+        assert_eq!(bound.parent_alg.as_deref(), Some("blake3-256"));
+        assert_eq!(bound.bench_alg.as_deref(), Some("blake3-256"));
+    }
+
+    #[test]
+    fn evolution_tag_from_args_omits_empty_block() {
+        // No hash field → None (receipt never carries an empty evolution {}).
+        assert!(EvolutionTag::from_args(None, None, None, None, None, None).is_none());
+        // Only artifact supplied → other alg fields stay None.
+        let t = EvolutionTag::from_args(
+            Some("11".repeat(32)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("artifact present");
+        assert!(t.is_present());
+        assert_eq!(t.artifact_alg.as_deref(), Some("blake3-256"));
+        assert_eq!(t.parent_hash, None);
+        assert_eq!(t.bench_hash, None);
+        // Honored explicit alg.
+        let t2 = EvolutionTag::from_args(
+            Some("11".repeat(32)),
+            Some("sha-256".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("artifact present");
+        assert_eq!(t2.artifact_alg.as_deref(), Some("sha-256"));
     }
 
     #[test]

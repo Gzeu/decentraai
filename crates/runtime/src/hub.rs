@@ -102,6 +102,67 @@ pub struct ExecuteRequest {
     /// the settlement to an artifact for passport anchoring.
     #[serde(default)]
     pub deliverable_hash: Option<String>,
+    /// Optional evolution anchor (request A of BACKEND_EVOLUTION.md): the
+    /// hashed artifact/parent/bench of a client generation. Recorded verbatim
+    /// on the receipt, never content-validated (only 64-hex checked, exactly
+    /// like `deliverable_hash`). Absent if nothing was sent.
+    #[serde(default)]
+    pub artifact_hash: Option<String>,
+    #[serde(default)]
+    pub artifact_alg: Option<String>,
+    #[serde(default)]
+    pub parent_hash: Option<String>,
+    #[serde(default)]
+    pub parent_alg: Option<String>,
+    #[serde(default)]
+    pub bench_hash: Option<String>,
+    #[serde(default)]
+    pub bench_alg: Option<String>,
+}
+
+/// Extract + validate optional evolution args from a JSON object (the MCP
+/// `arguments` map shared by the operator and consumer execute paths).
+/// Returns `Ok(Some(tag))` when at least one hash is present, `Ok(None)` when
+/// nothing was sent, or `Err(name)` naming the first hash field that isn't
+/// exactly 64 hex chars (fail-fast, same rule as `deliverable_hash`).
+pub fn evolution_tag_from_value(args: &serde_json::Value) -> Result<Option<decentraai_agent_hub::EvolutionTag>, String> {
+    let mut h = [None; 3]; // [artifact, parent, bench]
+    let mut algs = vec![None; 3];
+    const HASH_FIELDS: [&str; 3] = ["artifact_hash", "parent_hash", "bench_hash"];
+    const ALG_FIELDS: [&str; 3] = ["artifact_alg", "parent_alg", "bench_alg"];
+    for (i, f) in HASH_FIELDS.iter().enumerate() {
+        if let Some(v) = args.get(*f) {
+            match v.as_str() {
+                Some(hs) if hs.len() == 64 && hs.chars().all(|c| c.is_ascii_hexdigit()) => {
+                    h[i] = Some(hs.to_string());
+                }
+                Some(_) => return Err((*f).to_string()),
+                None => return Err((*f).to_string()),
+            }
+        }
+        if let Some(v) = args.get(ALG_FIELDS[i]) {
+            algs[i] = v.as_str().map(|s| s.to_string());
+        }
+    }
+    Ok(decentraai_agent_hub::EvolutionTag::from_args(
+        h[0].clone(), algs[0].clone(),
+        h[1].clone(), algs[1].clone(),
+        h[2].clone(), algs[2].clone(),
+    ))
+}
+
+impl ExecuteRequest {
+    /// Convert to an optional [`EvolutionTag`] for settlement anchoring.
+    pub fn evolution_tag(&self) -> Option<decentraai_agent_hub::EvolutionTag> {
+        decentraai_agent_hub::EvolutionTag::from_args(
+            self.artifact_hash.clone(),
+            self.artifact_alg.clone(),
+            self.parent_hash.clone(),
+            self.parent_alg.clone(),
+            self.bench_hash.clone(),
+            self.bench_alg.clone(),
+        )
+    }
 }
 
 // ---------- Handlers ----------
@@ -415,6 +476,20 @@ pub async fn hub_execute_handler(
             return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "deliverable_hash must be 64 hex chars"}))).into_response();
         }
     }
+    // Same fail-fast for each evolution hash field (request A): only length
+    // and hex are validated — content is never interpreted, exactly like
+    // `deliverable_hash`. `*_alg` is not length-checked (it's a label).
+    for (name, h) in [
+        ("artifact_hash", &req.artifact_hash),
+        ("parent_hash", &req.parent_hash),
+        ("bench_hash", &req.bench_hash),
+    ] {
+        if let Some(h) = h {
+            if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+                return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("{name} must be 64 hex chars")}))).into_response();
+            }
+        }
+    }
     hub.mark_executing(&req.task_id);
     // Settlement: distribute reward via QuotaLedger to team members or issuer/best bidder
     let team_members: Vec<(String, u8)> = hub
@@ -450,12 +525,13 @@ pub async fn hub_execute_handler(
     // deliverable binds an artifact. Old tasks without these stay valid.
     // (record_settlement subsumes settle: exactly one settlement event.)
     let settled_tick = hub.tick;
-    hub.record_settlement(
+    hub.record_settlement_with_evolution(
         &req.task_id,
         evidence_id.clone(),
         actor.clone(),
         settled_tick,
         req.deliverable_hash.clone(),
+        req.evolution_tag(),
     );
     hub.advance_tick();
     let hub_path = hub_path_for(&state.info.repo_root);
@@ -796,9 +872,7 @@ pub async fn hub_settle_receipt_handler(
         (Some(by), Some(tick)) => Some(format!("hub:{task_id}:{by}:{tick}")),
         _ => None,
     };
-    (
-        axum::http::StatusCode::OK,
-        Json(serde_json::json!({
+    let mut receipt = serde_json::json!({
             "task_id": task.id,
             "status": task.status,
             "issuer": task.issuer,
@@ -815,9 +889,13 @@ pub async fn hub_settle_receipt_handler(
             "winners": winners,
             "bids": bids,
             "contributions": contributions,
-        })),
-    )
-        .into_response()
+    });
+    // Request A: surface the evolution anchor beside deliverable_hash, only
+    // when present (additive — absent block never emits an empty {}).
+    if let Some(evo) = &task.evolution {
+        receipt["evolution"] = serde_json::to_value(evo).unwrap_or(serde_json::json!({}));
+    }
+    (axum::http::StatusCode::OK, Json(receipt)).into_response()
 }
 
 pub async fn hub_events_handler(

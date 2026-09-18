@@ -7571,6 +7571,20 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 }
             },
         };
+        // Request A: optional evolution anchor (artifact/parent/bench hashes),
+        // validated fail-fast exactly like deliverable_hash.
+        let evolution = match crate::hub::evolution_tag_from_value(&args) {
+            Ok(tag) => tag,
+            Err(name) => {
+                ctx.hub_action =
+                    serde_json::json!({"error": format!("{name} must be 64 hex chars")});
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&ctx.hub_action).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+        };
         // sybil: refusing to award the issuer their own bid happens BEFORE
         // anything mutates (no execution, no credit, no events). The no-bid
         // issuer fallback below is untouched (no bid exists there).
@@ -7617,12 +7631,13 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
         }
         // Receipt-grade record (same as the REST path — no divergence).
         let _settle_tick = hub.tick;
-        hub.record_settlement(
+        hub.record_settlement_with_evolution(
             &task_id,
             evidence_id.clone(),
             executor.to_string(),
             _settle_tick,
             deliverable.clone(),
+            evolution.clone(),
         );
         hub.advance_tick();
         let hub_path = crate::hub::hub_path_for(&state.info.repo_root);
@@ -7849,7 +7864,10 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
         // block above (line ~6564). This second duplicate block was causing a
         // deadlock by acquiring StdMutex<TrustStore> inside the tokio context
         // without spawn_blocking. Removed to fix the deadlock.
-        let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        let mut res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        if let Some(evo) = &evolution {
+            res["evolution"] = serde_json::to_value(evo).unwrap_or(serde_json::json!({}));
+        }
         ctx.hub_action = res;
     }
     // Society MCP handlers (M2 Society)
@@ -10682,6 +10700,19 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 }
             },
         };
+        // Request A: optional evolution anchor, fail-fast validated like
+        // deliverable_hash.
+        let evolution = match crate::hub::evolution_tag_from_value(&args) {
+            Ok(tag) => tag,
+            Err(name) => {
+                let body = mcp_error_envelope(&raw, -32602, "invalid_request", &format!("{name} must be 64 hex chars"));
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&body).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+        };
         // sybil: refusing to award the issuer their own bid happens BEFORE
         // anything mutates. The no-bid issuer fallback below is untouched.
         // (This branch answers in the path's own JSON-RPC error envelope,
@@ -10724,12 +10755,13 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         }
         // Receipt-grade record (same as the REST path — no divergence).
         let _settle_tick = hub.tick;
-        hub.record_settlement(
+        hub.record_settlement_with_evolution(
             &task_id,
             evidence_id.clone(),
             account.clone(),
             _settle_tick,
             deliverable.clone(),
+            evolution.clone(),
         );
         hub.advance_tick();
         let hub_path = crate::hub::hub_path_for(&state.info.repo_root);
@@ -10949,7 +10981,10 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 }
             }
         }
-        let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        let mut res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        if let Some(evo) = &evolution {
+            res["evolution"] = serde_json::to_value(evo).unwrap_or(serde_json::json!({}));
+        }
         let id = serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.get("id").cloned())
