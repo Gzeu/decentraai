@@ -1787,6 +1787,125 @@ async fn openapi_handler() -> Response {
 
 /// Builds the proxy router: the OpenAI-compatible surface, the dashboard
 /// (also the fallback), and the small JSON views that feed it.
+/// B1 additive refusal for every non-ok REST response: classifies by
+/// status, refined by the body's own typed error or message. Existing
+/// `refusal` keys win (site-attached reasons are more specific); typed
+/// `error.type` values inside the closed vocabulary are kept verbatim.
+/// Pure decision split from I/O so tests drive it without a server.
+fn rest_refusal_reason(status: u16, val: &serde_json::Value) -> Option<(&'static str, String)> {
+    if val.get("refusal").is_some() {
+        return None;
+    }
+    // Human detail: the error message when there is one, else the body.
+    let detail = val
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|v| v.as_str())
+        .or_else(|| val.get("error").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let detail_or_body = if detail.is_empty() {
+        serde_json::to_string(val).unwrap_or_default()
+    } else {
+        detail
+    };
+    // A known typed error is already exact — keep it verbatim.
+    if let Some(t) = val
+        .get("error")
+        .and_then(|e| e.get("type"))
+        .and_then(|v| v.as_str())
+    {
+        let mut known: Option<&'static str> = None;
+        for r in crate::mcp::CLOSED_REASONS.iter() {
+            if *r == t {
+                known = Some(*r);
+                break;
+            }
+        }
+        if let Some(reason) = known {
+            let d = if detail_or_body.is_empty() {
+                t.to_string()
+            } else {
+                detail_or_body
+            };
+            return Some((reason, d));
+        }
+    }
+    let reason = match status {
+        401 => "unauthenticated",
+        403 => "permission_error",
+        404 => "not_found",
+        409 => "conflict",
+        429 => "rate_limited",
+        500 => "internal_error",
+        502 => {
+            let m = detail_or_body.to_lowercase();
+            if m.contains("backend unreachable") {
+                "backend_unreachable"
+            } else if m.contains("no assist executor") {
+                "no_executor"
+            } else {
+                "internal_error"
+            }
+        }
+        _ => return None,
+    };
+    Some((reason, detail_or_body))
+}
+
+/// Axum layer: every non-ok (≥400) JSON REST response gains the additive
+/// B1 `refusal` envelope unless it already carries one. Successes,
+/// non-JSON bodies, streams and oversized bodies pass through byte-identical
+/// (probes and dashboards never see a difference on happy paths).
+async fn refusal_middleware(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let resp = next.run(req).await;
+    if resp.status().as_u16() < 400 {
+        return resp;
+    }
+    let is_json = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    if !is_json {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, 8192).await {
+        Ok(b) => b,
+        // Unreadable body: preserve the status, drop nothing we can keep.
+        // (Practically unreachable for small JSON error payloads.)
+        Err(_) => return axum::response::Response::from_parts(parts, axum::body::Body::empty()),
+    };
+    let mut val: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            let mut resp = axum::response::Response::from_parts(parts, axum::body::Body::from(bytes.to_vec()));
+            resp.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
+            return resp;
+        }
+    };
+    let pending = rest_refusal_reason(parts.status.as_u16(), &val);
+    if let (Some(obj), Some((reason, detail))) = (val.as_object_mut(), pending) {
+        obj.insert(
+            "refusal".to_string(),
+            serde_json::json!({"reason": reason, "detail": detail}),
+        );
+    }
+    let out = serde_json::to_vec(&val).unwrap_or_else(|_| bytes.to_vec());
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    let mut resp = axum::response::Response::from_parts(parts, axum::body::Body::from(out));
+    // Keep the JSON content type across the rebuild (avoid a dangling
+    // length after the body changed size).
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    resp
+}
+
 pub fn build_router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(root_dashboard_handler))
@@ -2110,6 +2229,9 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
+        // B1: every non-ok JSON REST response gains the additive refusal
+        // envelope (successes, streams and non-JSON pass through untouched).
+        .layer(axum::middleware::from_fn(refusal_middleware))
         .with_state(state)
 }
 
@@ -6384,6 +6506,26 @@ fn merge_peer_views(
     )
 }
 
+/// B1 JSON-RPC error envelope with the additive refusal: `reason` from the
+/// closed vocabulary, `detail` carrying the same human message. Callers
+/// name their reason explicitly (never guessed); unknown future reasons
+/// would pass through verbatim by the same shape.
+fn mcp_error_envelope(raw: &str, code: i64, reason: &str, message: impl Into<String>) -> serde_json::Value {
+    let message: String = message.into();
+    let id = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": code, "message": message.clone(), "refusal": {"reason": reason, "detail": message}}})
+}
+
+/// Embeddings input ceiling (chars, code points) for assist requests.
+/// MiniLM-class conservative floor: the only embeddings backend measured on
+/// this mesh rejects past ~2000 chars with a backend 500. Larger-model
+/// backends raise this in one place; until then oversize inputs are refused
+/// with a typed 400 instead of a dishonest 502.
+pub const EMBEDDINGS_MAX_INPUT_CHARS: u64 = 2000;
+
 /// Builds a compute-assist receipt with ONE shape on every path
 /// (consumer/operator × live/dry_run × success/failure). Uniform keys by
 /// construction — no path can silently diverge again:
@@ -8264,7 +8406,16 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
         // operator key triggers REAL remote work while a consumer key gets
         // an estimate — a safety asymmetry, not just asymmetry. Operator
         // holds no quota account, so balance fields read 0 under dry_run.
-        if crate::mcp::compute_dry_run(&raw) {
+        // Input ceiling (embeddings, operator arm): same typed 400 as the
+        // consumer path. The call_tool tail classifies error.type and
+        // attaches the refusal envelope automatically; the typed error here
+        // is the single source (no hand-built refusal to drift).
+        let (pre_chars, _, _) = assist_estimate_inputs(&capability, &payload);
+        let oversize_input =
+            capability == "embeddings" && pre_chars > EMBEDDINGS_MAX_INPUT_CHARS;
+        if oversize_input {
+            ctx.compute_result = serde_json::json!({"error": {"message": format!("input_too_long: embeddings input {pre_chars} chars exceeds {EMBEDDINGS_MAX_INPUT_CHARS}"), "type": "input_too_long"}});
+        } else if crate::mcp::compute_dry_run(&raw) {
             let card = decentraai_compute::RateCard::v1();
             let (est_chars, est_max_tokens, est_pages) =
                 assist_estimate_inputs(&capability, &payload);
@@ -8330,6 +8481,17 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                     // Uniform receipt on failure too (operator holds no
                     // quota: billed 0, balances 0, account null — the shape
                     // matches the consumer failure receipt key for key).
+                    // B1: failure envelopes carry the refusal classified from
+                    // the explanation (worker-reported cause, not a guess).
+                    let refusal = if success {
+                        serde_json::Value::Null
+                    } else if explanation.contains("backend unreachable") {
+                        serde_json::json!({"reason": "backend_unreachable", "detail": explanation})
+                    } else if explanation.contains("no assist executor") {
+                        serde_json::json!({"reason": "no_executor", "detail": explanation})
+                    } else {
+                        serde_json::json!({"reason": "business_error", "detail": explanation})
+                    };
                     let mut obj = serde_json::json!({
                         "status": if success { 200 } else { 502 },
                         "ok": success,
@@ -8337,6 +8499,9 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                         "explanation": explanation,
                         "body": result_json,
                     });
+                    if !success {
+                        obj["refusal"] = refusal;
+                    }
                     if !success {
                         let (ec, em, ep) = assist_estimate_inputs(&capability, &payload);
                         obj["receipt"] = compute_receipt(
@@ -9721,6 +9886,25 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         }
         let card = decentraai_compute::RateCard::v1();
         let (est_chars, est_max_tokens, est_pages) = assist_estimate_inputs(&capability, &payload);
+        // Input ceiling (embeddings): oversize inputs would die inside the
+        // backend as a 500 ("backend HTTP 500") — a lie that says the fabric
+        // is down. Refuse upfront with a typed 400 instead, on every path
+        // including dry_run (an estimate for an unexecutable call misleads).
+        if capability == "embeddings" && est_chars > EMBEDDINGS_MAX_INPUT_CHARS {
+            let body = mcp_error_envelope(
+                &raw,
+                -32602,
+                "input_too_long",
+                format!(
+                    "input_too_long: embeddings input {est_chars} chars exceeds {EMBEDDINGS_MAX_INPUT_CHARS}"
+                ),
+            );
+            return (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response();
+        }
         // dry_run: the full billing chain (estimate + rate card + receipt
         // composition) with zero reservation, zero execution, zero
         // consumption. The ONLY way to read a receipt shape without spending.
@@ -9834,11 +10018,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             .map(|a| (a.available, a.reserved))
             .unwrap_or((0, 0));
         if estimate > spendable {
-            let id = serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|v| v.get("id").cloned())
-                .unwrap_or(serde_json::Value::Null);
-            let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": format!("quota_exceeded: estimated cost {estimate} exceeds spendable (available {spendable}, reserved {reserved_now})")}});
+            let body = mcp_error_envelope(&raw, -32000, "quota_exceeded", format!("quota_exceeded: estimated cost {estimate} exceeds spendable (available {spendable}, reserved {reserved_now})"));
             return (
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 serde_json::to_string(&body).unwrap_or_default(),
@@ -9932,7 +10112,19 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             .and_then(|l| l.lock().unwrap().account(&account.to_string()))
             .map(|a| (a.available, a.consumed))
             .unwrap_or((0, 0));
-        let result_body = serde_json::json!({
+        // B1: failure envelopes carry the refusal classified from the
+        // explanation (worker-reported cause, not a guess); successes carry
+        // no `refusal` key at all (absent, never null).
+        let refusal: Option<serde_json::Value> = if success {
+            None
+        } else if explanation.contains("backend unreachable") {
+            Some(serde_json::json!({"reason": "backend_unreachable", "detail": explanation.clone()}))
+        } else if explanation.contains("no assist executor") {
+            Some(serde_json::json!({"reason": "no_executor", "detail": explanation.clone()}))
+        } else {
+            Some(serde_json::json!({"reason": "business_error", "detail": explanation.clone()}))
+        };
+        let mut result_body = serde_json::json!({
             "status": if success { 200 } else { 502 },
             "ok": success,
             "capability": capability,
@@ -9965,6 +10157,9 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             ),
             "body": result_json,
         });
+        if let Some(r) = refusal {
+            result_body["refusal"] = r;
+        }
         let id = serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.get("id").cloned())
@@ -10131,11 +10326,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                     if lg.reserve(account, &rid, cost).is_ok() {
                         reservation_id = Some(rid.clone());
                     } else {
-                        let id = serde_json::from_str::<serde_json::Value>(&raw)
-                            .ok()
-                            .and_then(|v| v.get("id").cloned())
-                            .unwrap_or(serde_json::Value::Null);
-                        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": "quota insufficient"}});
+                        let body = mcp_error_envelope(&raw, -32000, "insufficient_quota", "quota insufficient");
                         return (
                             [(axum::http::header::CONTENT_TYPE, "application/json")],
                             serde_json::to_string(&body).unwrap_or_default(),
@@ -10432,11 +10623,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         let task = match hub.tasks.get(&task_id).cloned() {
             Some(t) => t,
             None => {
-                let id = serde_json::from_str::<serde_json::Value>(&raw)
-                    .ok()
-                    .and_then(|v| v.get("id").cloned())
-                    .unwrap_or(serde_json::Value::Null);
-                let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": "task not found"}});
+                let body = mcp_error_envelope(&raw, -32000, "not_found", "task not found");
                 return (
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
                     serde_json::to_string(&body).unwrap_or_default(),
@@ -10486,11 +10673,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                     Some(dh.to_string())
                 }
                 _ => {
-                    let id = serde_json::from_str::<serde_json::Value>(&raw)
-                        .ok()
-                        .and_then(|v| v.get("id").cloned())
-                        .unwrap_or(serde_json::Value::Null);
-                    let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32602, "message": "deliverable_hash must be 64 hex chars"}});
+                    let body = mcp_error_envelope(&raw, -32602, "invalid_request", "deliverable_hash must be 64 hex chars");
                     return (
                         [(axum::http::header::CONTENT_TYPE, "application/json")],
                         serde_json::to_string(&body).unwrap_or_default(),
@@ -10505,11 +10688,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         // whose schema has no `type` slot — the stable `self_bid_forbidden`
         // message token is what clients key off.)
         if hub.self_bid_award(&task_id) {
-            let id = serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|v| v.get("id").cloned())
-                .unwrap_or(serde_json::Value::Null);
-            let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": "self_bid_forbidden: task issuer cannot be awarded their own bid"}});
+            let body = mcp_error_envelope(&raw, -32000, "policy_denied", "self_bid_forbidden: task issuer cannot be awarded their own bid");
             return (
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 serde_json::to_string(&body).unwrap_or_default(),
@@ -19619,6 +19798,7 @@ async fn route_remote_chat(
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
+        [(header::CONTENT_TYPE, "application/json")],
         "{\"error\":{\"message\":\"missing or invalid API token\",\"type\":\"authentication_error\"}}",
     )
         .into_response()
@@ -19640,6 +19820,7 @@ fn jsonrpc_method_is(raw: &str, method: &str) -> bool {
 fn forbidden(message: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "application/json")],
         format!(
             "{{\"error\":{{\"message\":\"{}\",\"type\":\"permission_error\"}}}}",
             message.replace('"', "\\\"")
@@ -19724,6 +19905,7 @@ fn not_served(model: &str) -> Response {
 fn too_many_requests(limit: usize) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
+        [(header::CONTENT_TYPE, "application/json")],
         format!(
             "{{\"error\":{{\"message\":\"rate limit exceeded ({limit} requests/minute for your tier)\",\"type\":\"rate_limit_error\"}}}}"
         ),
@@ -19868,6 +20050,33 @@ pub fn ensure_api_token(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn rest_refusal_reason_status_table() {
+        let v = |s: &str| serde_json::json!({"error": {"message": s, "type": "x"}});
+        // Row-by-row status mapping (typed-branch bypassed with unknown type).
+        assert_eq!(rest_refusal_reason(401, &v("nope")).unwrap().0, "unauthenticated");
+        assert_eq!(rest_refusal_reason(403, &v("nope")).unwrap().0, "permission_error");
+        assert_eq!(rest_refusal_reason(404, &v("nope")).unwrap().0, "not_found");
+        assert_eq!(rest_refusal_reason(409, &v("nope")).unwrap().0, "conflict");
+        assert_eq!(rest_refusal_reason(429, &v("nope")).unwrap().0, "rate_limited");
+        assert_eq!(rest_refusal_reason(500, &v("boom")).unwrap().0, "internal_error");
+        assert!(rest_refusal_reason(200, &v("ok")).is_none());
+        assert!(rest_refusal_reason(418, &v("tea")).is_none());
+        // 502 sub-classification.
+        let b = serde_json::json!({"error": {"message": "backend unreachable: conn refused", "type": "x"}});
+        assert_eq!(rest_refusal_reason(502, &b).unwrap().0, "backend_unreachable");
+        let n = serde_json::json!({"error": {"message": "no assist executor for ocr", "type": "x"}});
+        assert_eq!(rest_refusal_reason(502, &n).unwrap().0, "no_executor");
+        let g = serde_json::json!({"error": {"message": "worker blew up", "type": "x"}});
+        assert_eq!(rest_refusal_reason(502, &g).unwrap().0, "internal_error");
+        // Existing refusal wins (additive: never overwrite site-attached).
+        let kept = serde_json::json!({"error": {"message": "x", "type": "y"}, "refusal": {"reason": "no_executor", "detail": "d"}});
+        assert!(rest_refusal_reason(500, &kept).is_none());
+        // Known typed error kept verbatim, not remapped by status.
+        let typed = serde_json::json!({"error": {"message": "quota gone", "type": "quota_expired"}});
+        assert_eq!(rest_refusal_reason(429, &typed).unwrap().0, "quota_expired");
+    }
 
     #[test]
     fn sim_linked_anchors_excluded_from_trust_totals() {

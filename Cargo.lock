@@ -1104,6 +1104,7 @@ dependencies = [
 name = "decentraai-compute"
 version = "1.0.0"
 dependencies = [
+ "chrono",
  "decentraai-types",
  "libp2p",
  "serde",

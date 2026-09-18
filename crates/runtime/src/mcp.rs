@@ -2993,19 +2993,168 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "orchestrate_status" => &ctx.orchestrate_status_result,
         _ => return None,
     };
+    let mut data = data.clone();
+    attach_content_refusal(&mut data);
     Some(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string()),
+            "text": serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string()),
         }],
     }))
 }
 
+/// B1: attaches the additive refusal envelope to MCP content carrying an
+/// error. Typed shapes win (a known `type` is already exact); otherwise
+/// the prose classifier decides; unclassifiable stays `business_error`.
+/// Shapes without an `error` key (successes) or with a refusal already
+/// present pass through untouched.
+fn attach_content_refusal(data: &mut Value) {
+    let (reason, detail) = match data.get("error") {
+        None => return,
+        Some(err) => match err.get("type").and_then(|v| v.as_str()) {
+            Some(t) if CLOSED_REASONS.contains(&t) => {
+                let d = err.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                (t.to_string(), d.to_string())
+            }
+            _ => {
+                let msg = err
+                    .as_str()
+                    .or_else(|| err.get("message").and_then(|v| v.as_str()));
+                match msg {
+                    Some(m) => (refusal_reason_for_message(m).to_string(), m.to_string()),
+                    None => return,
+                }
+            }
+        },
+    };
+    if let Some(obj) = data.as_object_mut() {
+        if !obj.contains_key("refusal") {
+            obj.insert(
+                "refusal".to_string(),
+                json!({"reason": reason, "detail": detail}),
+            );
+        }
+    }
+}
+
+/// B1 closed refusal vocabulary (16 tokens). Unknown future tokens pass
+/// through verbatim — never guessed into a known one.
+pub const CLOSED_REASONS: &[&str] = &[
+    "unauthenticated",
+    "permission_error",
+    "unknown_tool",
+    "invalid_request",
+    "not_found",
+    "conflict",
+    "policy_denied",
+    "rate_limited",
+    "insufficient_quota",
+    "quota_exceeded",
+    "quota_expired",
+    "no_executor",
+    "backend_unreachable",
+    "input_too_long",
+    "business_error",
+    "internal_error",
+];
+
+/// B1 additive refusal envelope: `{reason, detail}` riding alongside
+/// (never replacing) the existing error shape. `reason` comes from the
+/// closed 16-token vocabulary; `detail` is the human sentence verbatim.
+/// Absent on success by construction (only error paths call this).
+pub fn refusal_object(reason: &str, detail: impl Into<String>) -> Value {
+    json!({"refusal": {"reason": reason, "detail": detail.into()}})
+}
+
+/// Maps a human error sentence to the closed refusal vocabulary.
+/// Derivation order: quota tokens first (exact, deliberate), then policy,
+/// not-found, conflict, transport/capacity, input bounds; fallback is
+/// `business_error` (never a guess at a specific cause).
+pub fn refusal_reason_for_message(msg: &str) -> &'static str {
+    let m = msg.to_lowercase();
+    if m.contains("quota_exceeded") {
+        "quota_exceeded"
+    } else if m.contains("insufficient_quota")
+        || m.contains("insufficient_balance")
+        || m.contains("insufficient quota")
+    {
+        // Payout/ledger balance failures speak "insufficient_balance"; the
+        // closed token is "insufficient_quota" (same economic cause).
+        "insufficient_quota"
+    } else if m.contains("quota_expired") || m.contains("quota period expired") {
+        "quota_expired"
+    } else if m.contains("unauthenticated")
+        || m.contains("missing or invalid")
+        || m.contains("invalid api token")
+        || m.contains("invalid token")
+        || m.contains("not authenticated")
+        || m.contains("unauthorized")
+    {
+        // Auth failures are identity failures, not policy: the real 401
+        // prose ("missing or invalid API token") lands here too, so MCP
+        // content and REST status agree on the same token.
+        "unauthenticated"
+    } else if m.contains("self_deal_forbidden")
+        || m.contains("self_bid_forbidden")
+        || m.contains("policy_den")
+    {
+        // Sybil/policy refusals without an HTTP-status home (verbatim
+        // round-trips too). Ordered BEFORE permission_error: the sybil
+        // sentences contain "forbidden" as a substring.
+        "policy_denied"
+    } else if m.contains("may only call")
+        || m.contains("missing scope")
+        || m.contains("forbidden")
+        || m.contains("denied")
+    {
+        // 403-class prose: the REST 403 status maps to the same token, so
+        // MCP content and REST status agree.
+        "permission_error"
+    } else if m.contains("not found") || m.contains("unknown ") || m.contains("no such ") {
+        "not_found"
+    } else if m.contains("already exists")
+        || m.contains("not open")
+        || m.contains("already settled")
+        || m.contains("mismatch")
+        || m.contains("duplicate")
+        || m.contains("expired")
+    {
+        "conflict"
+    } else if m.contains("backend unreachable") {
+        "backend_unreachable"
+    } else if m.contains("no assist executor") {
+        "no_executor"
+    } else if m.contains("too long") || m.contains("too large") || m.contains("oversize") {
+        "input_too_long"
+    } else if m.contains("rate limit")
+        || m.contains("rate_limit")
+        || m.contains("too many requests")
+    {
+        // The real 429 prose ("rate limit exceeded (N requests/minute…)")
+        // lands here; the REST 429 status maps to the same token.
+        "rate_limited"
+    } else {
+        "business_error"
+    }
+}
+
 fn error_response(id: Value, code: i64, message: impl Into<String>) -> Value {
+    let message: String = message.into();
+    let reason = match code {
+        -32601 => "unknown_tool",
+        -32602 | -32600 | -32700 => "invalid_request",
+        // -32000 is the generic server-error slot: classify by message so
+        // quota tokens survive verbatim instead of collapsing.
+        _ => refusal_reason_for_message(&message),
+    };
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": { "code": code, "message": message.into() },
+        "error": {
+            "code": code,
+            "message": message.clone(),
+            "refusal": {"reason": reason, "detail": message},
+        },
     })
 }
 
@@ -3478,6 +3627,30 @@ mod tests {
         assert!(content.contains("\"nodes\":[]"));
         assert!(content.contains("\"capabilities\":[]"));
         assert!(content.contains("\"sessions_active\":0"));
+    }
+
+    #[test]
+    fn refusal_classifier_facts() {
+        // Closed vocabulary: exactly 16 stable tokens, no silent growth.
+        assert_eq!(CLOSED_REASONS.len(), 16);
+        // Row-by-row prose classification (B1 mapping table).
+        assert_eq!(refusal_reason_for_message("missing or invalid api token"), "unauthenticated");
+        assert_eq!(refusal_reason_for_message("consumer key missing scope for capability 'ocr'"), "permission_error");
+        assert_eq!(refusal_reason_for_message("unknown task ct-9"), "not_found");
+        assert_eq!(refusal_reason_for_message("task already settled"), "conflict");
+        assert_eq!(refusal_reason_for_message("input too long: 2100 chars"), "input_too_long");
+        assert_eq!(refusal_reason_for_message("quota period expired for this key — renew_quota to extend it"), "quota_expired");
+        assert_eq!(refusal_reason_for_message("insufficient_balance: redeemable 0 < 100"), "insufficient_quota");
+        assert_eq!(refusal_reason_for_message("rate limit exceeded"), "rate_limited");
+        assert_eq!(refusal_reason_for_message("backend unreachable: refused"), "backend_unreachable");
+        assert_eq!(refusal_reason_for_message("no assist executor for ocr"), "no_executor");
+        assert_eq!(refusal_reason_for_message("self_deal_forbidden: provider and consumer must differ"), "policy_denied");
+        assert_eq!(refusal_reason_for_message("self_bid_forbidden: bidder and task issuer must differ"), "policy_denied");
+        assert_eq!(refusal_reason_for_message("totally novel failure"), "business_error");
+        // Envelope shape: additive, closed reason, verbatim detail.
+        let env = refusal_object("not_found", "task ct-9 missing");
+        assert_eq!(env["refusal"]["reason"], "not_found");
+        assert_eq!(env["refusal"]["detail"], "task ct-9 missing");
     }
 
     #[test]
