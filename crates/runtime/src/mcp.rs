@@ -355,10 +355,11 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "bench_get",
-            description: "Read a published evolution bench by id. Returns metadata and public train items; holdout targets/checks remain node-private.",
+            description: "Read a published evolution bench by id or announced bench_hash. Returns metadata and public train items; holdout targets/checks remain node-private.",
             input_schema: json!({ "type": "object", "properties": {
-                "bench_id": { "type": "string", "maxLength": 128 }
-            }, "required": ["bench_id"], "additionalProperties": false }),
+                "bench_id": { "type": "string", "maxLength": 128 },
+                "bench_hash": { "type": "string", "minLength": 64, "maxLength": 64 }
+            }, "anyOf": [{"required":["bench_id"]},{"required":["bench_hash"]}], "additionalProperties": false }),
             annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
@@ -373,15 +374,17 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "bench_score",
-            description: "Score an artifact against a node-owned evolution bench. Returns train/hold counts and id+passed only; holdout targets never leave the node.",
+            description: "Score an artifact against a node-owned evolution bench by id or hash. Returns train/hold counts and id+passed only; holdout targets never leave the node.",
             input_schema: json!({ "type": "object", "properties": {
                 "bench_id": { "type": "string", "maxLength": 128 },
+                "bench_hash": { "type": "string", "minLength": 64, "maxLength": 64 },
                 "artifact_hash": { "type": "string", "description": "Optional 64-hex artifact hash to include in the score receipt" },
                 "artifact": { "type": "object", "description": "Canonical artifact/genome object; its hash is recalculated by the node" },
                 "rows": { "type": "object", "description": "Map of bench item id to rendered output text" },
                 "max_micro_cu_per_run": { "type": "integer", "minimum": 0 },
-                "lease_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
-            }, "required": ["bench_id"], "additionalProperties": false }),
+                "lease_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+                "lease_id": { "type": "string", "maxLength": 128 }
+            }, "anyOf": [{"required":["bench_id"]},{"required":["bench_hash"]}], "additionalProperties": false }),
             annotations: ToolAnnotations::additive(),
         },
         ToolDef {
@@ -3068,6 +3071,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
     let mut data = data.clone();
     attach_content_refusal(&mut data);
     Some(json!({
+        "isError": matches!(name, "bench_get" | "bench_publish" | "bench_score") && data.get("error").is_some(),
         "content": [{
             "type": "text",
             "text": serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string()),

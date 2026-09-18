@@ -1281,6 +1281,26 @@ impl ApiState {
         }
     }
 
+    /// Evolution control is an operator capability, not a master-token-only
+    /// browser privilege. A subscriber carrying the operator role may publish
+    /// and score benches; the master remains accepted for node administration.
+    pub(crate) fn require_evolution_operator(&self, headers: &HeaderMap) -> Result<(), GateError> {
+        match self.classify(headers) {
+            Ok(Auth::Master) | Ok(Auth::Open) => Ok(()),
+            Ok(Auth::Subscriber { role, .. }) if role == decentraai_tokens::Role::Operator => Ok(()),
+            Ok(Auth::Subscriber { name, .. }) => Err(GateError::Forbidden(format!(
+                "'{name}' is a client token; evolution tools need an operator or master token"
+            ))),
+            Ok(Auth::Consumer { key_id, .. }) => Err(GateError::Forbidden(format!(
+                "'{key_id}' is a consumer API key; evolution tools need an operator token with evolution scope"
+            ))),
+            Ok(Auth::Wallet { wallet_address, .. }) => Err(GateError::Forbidden(format!(
+                "'{wallet_address}' is a wallet session; evolution tools need an operator token"
+            ))),
+            Err(_) => Err(GateError::Unauthorized),
+        }
+    }
+
     /// Role separation (H4): the operational read views (status, workers,
     /// network, execution, peers) are allowed for the master (admin), open
     /// mode (single-user), or an `operator`-role subscription token. A plain
@@ -1936,6 +1956,7 @@ async fn evolution_state_handler(
     let bench_hashes: Vec<String> = store.benches.values().map(|b| b.bench_hash.clone()).collect();
     let body = serde_json::json!({
         "bench_count": benches.len(),
+        "benches": benches,
         "generations": store.scores.len(),
         "distinct_artifacts": store.scores.iter().map(|s| s.artifact_hash.as_str()).collect::<std::collections::BTreeSet<_>>().len(),
         "accepted": store.scores.iter().filter(|s| s.accepted).count(),
@@ -6802,7 +6823,7 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
     // holdout private. All projections below are metadata or id+passed only.
     if let Some((name, args)) = crate::mcp::evolution_request(&raw) {
         if matches!(name.as_str(), "bench_publish" | "bench_score") {
-            if let Err(e) = state.require_master(&headers) {
+            if let Err(e) = state.require_evolution_operator(&headers) {
                 return e.into_response();
             }
         }
@@ -6824,6 +6845,7 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                     .collect();
                 ctx.evolution = serde_json::json!({
                     "bench_count": benches.len(),
+                    "benches": benches,
                     "generations": store.scores.len(),
                     "distinct_artifacts": store.scores.iter().map(|s| s.artifact_hash.as_str()).collect::<std::collections::BTreeSet<_>>().len(),
                     "accepted": store.scores.iter().filter(|s| s.accepted).count(),
@@ -6837,8 +6859,8 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 });
             }
             "bench_get" => {
-                let id = args.get("bench_id").and_then(|v| v.as_str()).unwrap_or("");
-                ctx.evolution = match store.get(id) {
+                let id = args.get("bench_id").or_else(|| args.get("bench_hash")).and_then(|v| v.as_str()).unwrap_or("");
+                ctx.evolution = match store.get_by_id_or_hash(id) {
                     Some(b) => {
                         serde_json::json!({
                             "bench_id": b.bench_id, "title": b.title,
@@ -6847,7 +6869,7 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                             "train_total": b.train_count(), "hold_total": b.hold_count(),
                         })
                     }
-                    None => serde_json::json!({"error": "bench not found"}),
+                    None => serde_json::json!({"error": "bench not found", "refusal": {"reason": "not_found", "detail": "bench not found"}}),
                 };
             }
             "bench_publish" => {
@@ -6884,19 +6906,14 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 }
             }
             "bench_score" => {
-                let id = args.get("bench_id").and_then(|v| v.as_str()).unwrap_or("");
+                let id = args.get("bench_id").or_else(|| args.get("bench_hash")).and_then(|v| v.as_str()).unwrap_or("");
                 let rows = args.get("rows").and_then(|v| v.as_object()).cloned().unwrap_or_default();
                 let artifact = args.get("artifact").cloned().unwrap_or(serde_json::Value::Null);
                 let fallback = artifact.as_str().map(str::to_string).unwrap_or_else(|| {
                     serde_json::to_string(&artifact).unwrap_or_default()
                 });
-                ctx.evolution = match store.get(id) {
+                ctx.evolution = match store.get_by_id_or_hash(id).cloned() {
                     Some(b) => {
-                        let score = crate::evolution::score_bench(
-                            &b.items,
-                            &|item_id| rows.get(item_id).and_then(|v| v.as_str()).map(str::to_string),
-                            &fallback,
-                        );
                         let artifact_hash = args
                             .get("artifact_hash")
                             .and_then(|v| v.as_str())
@@ -6932,11 +6949,27 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                             )
                                 .into_response();
                         }
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let lease_seconds = args.get("lease_seconds").and_then(|v| v.as_u64()).unwrap_or(300);
+                        let cost = b.items.len() as u64;
+                        let max_micro_cu_per_run = args.get("max_micro_cu_per_run").and_then(|v| v.as_u64()).unwrap_or(cost);
+                        let lease_id = args.get("lease_id").and_then(|v| v.as_str());
+                        let lease = match store.use_score_lease(&b.bench_id, &artifact_hash, lease_id, lease_seconds, max_micro_cu_per_run, cost, now) {
+                            Ok(lease) => lease,
+                            Err(e) => {
+                                let body = mcp_error_envelope(&raw, -32000, "budget_denied", e);
+                                return ([(axum::http::header::CONTENT_TYPE, "application/json")], body.to_string()).into_response();
+                            }
+                        };
+                        let score = crate::evolution::score_bench(
+                            &b.items,
+                            &|item_id| rows.get(item_id).and_then(|v| v.as_str()).map(str::to_string),
+                            &fallback,
+                        );
                         if !artifact_hash.is_empty() {
-                            let at = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
                             store.record_score(crate::evolution::EvolutionScoreRecord {
                                 artifact_hash: artifact_hash.clone(),
                                 bench_hash: score.bench_hash.clone(),
@@ -6945,7 +6978,7 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                                 score: score.score,
                                 total: score.total,
                                 accepted: score.hold.passed == score.hold.total,
-                                at,
+                                at: now,
                                 evidence_id: None,
                             });
                             let path = crate::evolution::benches_path_for(&state.info.repo_root);
@@ -6955,11 +6988,15 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                         if !artifact_hash.is_empty() {
                             out["artifact_hash"] = serde_json::Value::String(artifact_hash);
                         }
-                        out["lease_seconds"] = args.get("lease_seconds").cloned().unwrap_or_else(|| serde_json::json!(300));
-                        out["max_micro_cu_per_run"] = args.get("max_micro_cu_per_run").cloned().unwrap_or_else(|| serde_json::json!(0));
+                        out["lease_id"] = serde_json::Value::String(lease.lease_id);
+                        out["lease_expires_at"] = serde_json::json!(lease.lease_expires_at);
+                        out["lease_seconds"] = serde_json::json!(lease.lease_expires_at.saturating_sub(now));
+                        out["max_micro_cu_per_run"] = serde_json::json!(lease.max_micro_cu_per_run);
+                        out["micro_cu_reserved"] = serde_json::json!(lease.micro_cu_reserved);
+                        out["micro_cu_consumed"] = serde_json::json!(lease.micro_cu_consumed);
                         out
                     }
-                    None => serde_json::json!({"error": "bench not found"}),
+                    None => serde_json::json!({"error": "bench not found", "refusal": {"reason": "not_found", "detail": "bench not found"}}),
                 };
             }
             _ => {}

@@ -366,6 +366,31 @@ pub struct BenchStore {
     /// the state projection can report measured generations/artifacts.
     #[serde(default)]
     pub scores: Vec<EvolutionScoreRecord>,
+    #[serde(default)]
+    pub leases: BTreeMap<String, EvolutionLease>,
+    #[serde(default)]
+    pub next_lease_nonce: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionLease {
+    pub lease_id: String,
+    pub bench_id: String,
+    pub artifact_hash: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub max_micro_cu_per_run: u64,
+    #[serde(default)]
+    pub consumed_micro_cu: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionLeaseReceipt {
+    pub lease_id: String,
+    pub lease_expires_at: u64,
+    pub max_micro_cu_per_run: u64,
+    pub micro_cu_reserved: u64,
+    pub micro_cu_consumed: u64,
 }
 
 /// Validate immutable bench inputs before they are persisted. An unknown check
@@ -426,8 +451,72 @@ impl BenchStore {
     pub fn get(&self, id: &str) -> Option<&EvolBench> {
         self.benches.get(id)
     }
+    pub fn get_by_id_or_hash(&self, id_or_hash: &str) -> Option<&EvolBench> {
+        self.benches
+            .get(id_or_hash)
+            .or_else(|| self.benches.values().find(|b| b.bench_hash == id_or_hash))
+    }
     pub fn record_score(&mut self, record: EvolutionScoreRecord) {
         self.scores.push(record);
+    }
+
+    pub fn use_score_lease(
+        &mut self,
+        bench_id: &str,
+        artifact_hash: &str,
+        lease_id: Option<&str>,
+        lease_seconds: u64,
+        max_micro_cu_per_run: u64,
+        cost: u64,
+        now: u64,
+    ) -> Result<EvolutionLeaseReceipt, String> {
+        if !(1..=86_400).contains(&lease_seconds) {
+            return Err("lease_seconds must be between 1 and 86400".into());
+        }
+        if cost > max_micro_cu_per_run && lease_id.is_none() {
+            return Err(format!("max_micro_cu_per_run exceeded before scoring: need {cost}, limit {max_micro_cu_per_run}"));
+        }
+        if let Some(id) = lease_id {
+            let lease = self.leases.get_mut(id).ok_or_else(|| "lease_not_found".to_string())?;
+            if lease.expires_at <= now {
+                return Err("lease_expired".into());
+            }
+            if lease.bench_id != bench_id || lease.artifact_hash != artifact_hash {
+                return Err("lease_scope_conflict".into());
+            }
+            if cost > lease.max_micro_cu_per_run.saturating_sub(lease.consumed_micro_cu) {
+                return Err("max_micro_cu_per_run exceeded before scoring".into());
+            }
+            lease.consumed_micro_cu = lease.consumed_micro_cu.saturating_add(cost);
+            return Ok(EvolutionLeaseReceipt {
+                lease_id: lease.lease_id.clone(),
+                lease_expires_at: lease.expires_at,
+                max_micro_cu_per_run: lease.max_micro_cu_per_run,
+                micro_cu_reserved: lease.max_micro_cu_per_run,
+                micro_cu_consumed: lease.consumed_micro_cu,
+            });
+        }
+        let nonce = self.next_lease_nonce;
+        self.next_lease_nonce = self.next_lease_nonce.saturating_add(1);
+        let lease_id = format!("evo-lease-{nonce}-{}", &artifact_hash[..8.min(artifact_hash.len())]);
+        let lease = EvolutionLease {
+            lease_id: lease_id.clone(),
+            bench_id: bench_id.to_string(),
+            artifact_hash: artifact_hash.to_string(),
+            issued_at: now,
+            expires_at: now.saturating_add(lease_seconds),
+            max_micro_cu_per_run,
+            consumed_micro_cu: cost,
+        };
+        let receipt = EvolutionLeaseReceipt {
+            lease_id: lease_id.clone(),
+            lease_expires_at: lease.expires_at,
+            max_micro_cu_per_run,
+            micro_cu_reserved: max_micro_cu_per_run,
+            micro_cu_consumed: cost,
+        };
+        self.leases.insert(lease_id, lease);
+        Ok(receipt)
     }
     /// Publish a new bench: computes `bench_hash`, stores it, returns the bench.
     pub fn publish(
@@ -532,6 +621,27 @@ mod tests {
             check: Some(CheckSpec { check_type: "llm_judge".into(), value: json!("x"), flags: None, tol: None }),
         }];
         assert!(validate_bench_items(&items).is_err());
+    }
+
+    #[test]
+    fn score_lease_budget_and_expiry_are_enforced() {
+        let mut store = BenchStore::default();
+        let first = store
+            .use_score_lease("b", "aabbccdd", None, 10, 2, 2, 100)
+            .unwrap();
+        assert_eq!(first.micro_cu_consumed, 2);
+        assert!(store
+            .use_score_lease("b", "aabbccdd", Some(&first.lease_id), 10, 2, 1, 100)
+            .is_err());
+        assert_eq!(
+            store
+                .use_score_lease("b", "aabbccdd", Some(&first.lease_id), 10, 2, 1, 111)
+                .unwrap_err(),
+            "lease_expired"
+        );
+        assert!(store
+            .use_score_lease("b", "aabbccdd", None, 10, 1, 2, 100)
+            .is_err());
     }
 
     #[test]
