@@ -126,8 +126,8 @@ pub struct ExecuteRequest {
 /// nothing was sent, or `Err(name)` naming the first hash field that isn't
 /// exactly 64 hex chars (fail-fast, same rule as `deliverable_hash`).
 pub fn evolution_tag_from_value(args: &serde_json::Value) -> Result<Option<decentraai_agent_hub::EvolutionTag>, String> {
-    let mut h = [None; 3]; // [artifact, parent, bench]
-    let mut algs = vec![None; 3];
+    let mut h: [Option<String>; 3] = [None, None, None]; // [artifact, parent, bench]
+    let mut algs: [Option<String>; 3] = [None, None, None];
     const HASH_FIELDS: [&str; 3] = ["artifact_hash", "parent_hash", "bench_hash"];
     const ALG_FIELDS: [&str; 3] = ["artifact_alg", "parent_alg", "bench_alg"];
     for (i, f) in HASH_FIELDS.iter().enumerate() {

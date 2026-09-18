@@ -714,12 +714,18 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "hub_execute",
-            description: "Execute a Hub task via team (MCP, dca_): task_id. Distributes reward via QuotaLedger to team members by share, generates evidence, advances reputation. Re-executing a settled task is idempotent (returns existing evidence). Optional deliverable_hash (64 hex) binds a work artifact, surfaced in the settlement receipt.",
+            description: "Execute a Hub task via team (MCP, dca_): task_id. Distributes reward via QuotaLedger to team members by share, generates evidence, advances reputation. Re-executing a settled task is idempotent (returns existing evidence). Optional deliverable_hash (64 hex) binds a work artifact, surfaced in the settlement receipt. Optional evolution anchor (artifact_hash / parent_hash / bench_hash, each 64 hex, with optional *_alg defaulting to blake3-256) records a client generation in the public receipt.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "task_id": { "type": "string", "description": "Task id to execute" },
-                    "deliverable_hash": { "type": "string", "description": "Optional hash of the work deliverable (64 hex chars)" }
+                    "deliverable_hash": { "type": "string", "description": "Optional hash of the work deliverable (64 hex chars)" },
+                    "artifact_hash": { "type": "string", "description": "Optional 64-hex hash of the evolved artifact" },
+                    "artifact_alg": { "type": "string", "enum": ["blake3-256", "sha-256"], "description": "Algorithm for artifact_hash (default blake3-256)" },
+                    "parent_hash": { "type": "string", "description": "Optional 64-hex hash of the parent artifact" },
+                    "parent_alg": { "type": "string", "enum": ["blake3-256", "sha-256"], "description": "Algorithm for parent_hash (default blake3-256)" },
+                    "bench_hash": { "type": "string", "description": "Optional 64-hex hash of the bench the artifact was graded on" },
+                    "bench_alg": { "type": "string", "enum": ["blake3-256", "sha-256"], "description": "Algorithm for bench_hash (default blake3-256)" }
                 },
                 "required": ["task_id"],
                 "additionalProperties": false
