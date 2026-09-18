@@ -142,6 +142,8 @@ pub struct McpContext {
     pub renew_result: Value,
     /// Billing rate card snapshot (§7 compute): versioned rates, read-only.
     pub rate_card: Value,
+    /// Evolution bench/state result, precomputed by the HTTP layer.
+    pub evolution: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -254,6 +256,8 @@ pub fn required_scopes_for(tool_name: &str) -> &'static [&'static str] {
         "renew_quota" => &["economy"],
         // Demand signal tools — available to all authenticated users
         "announce_demand" | "list_demands" | "cancel_demand" => &[],
+        "bench_get" | "evolution_state" => &[],
+        "bench_publish" | "bench_score" => &["evolution"],
         // Orchestrate scope
         "orchestrate_propose" | "orchestrate_status" => &["orchestrate"],
         // Economy scope
@@ -342,6 +346,43 @@ pub fn all_tools() -> Vec<ToolDef> {
             description: "Billing rate card (§7 compute): versioned micro-CU rates per capability with rounding rule and unit. Read-only; predict any receipt offline as ceil(tokens_in/quantum)*rate + ceil(tokens_out/quantum)*rate. The same object is echoed in every compute receipt.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
             annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "evolution_state",
+            description: "Read-only evolution summary: published bench count and aggregate generation/artifact state. Holdout contents are never exposed.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "bench_get",
+            description: "Read a published evolution bench by id. Returns metadata and public train items; holdout targets/checks remain node-private.",
+            input_schema: json!({ "type": "object", "properties": {
+                "bench_id": { "type": "string", "maxLength": 128 }
+            }, "required": ["bench_id"], "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "bench_publish",
+            description: "Publish an immutable node-owned evolution bench. Holdout items stay private and are only graded by the node.",
+            input_schema: json!({ "type": "object", "properties": {
+                "bench_id": { "type": "string", "maxLength": 128 },
+                "title": { "type": "string", "maxLength": 256 },
+                "items": { "type": "array", "maxItems": 10000 }
+            }, "required": ["bench_id", "items"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
+            name: "bench_score",
+            description: "Score an artifact against a node-owned evolution bench. Returns train/hold counts and id+passed only; holdout targets never leave the node.",
+            input_schema: json!({ "type": "object", "properties": {
+                "bench_id": { "type": "string", "maxLength": 128 },
+                "artifact_hash": { "type": "string", "description": "Optional 64-hex artifact hash to include in the score receipt" },
+                "artifact": { "type": "object", "description": "Canonical artifact/genome object; its hash is recalculated by the node" },
+                "rows": { "type": "object", "description": "Map of bench item id to rendered output text" },
+                "max_micro_cu_per_run": { "type": "integer", "minimum": 0 },
+                "lease_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+            }, "required": ["bench_id"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "renew_quota",
@@ -2103,6 +2144,30 @@ pub fn hub_execute_request(raw: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// Extract an evolution tool call and its arguments. Validation of the
+/// closed schema belongs to the HTTP boundary; this helper only identifies
+/// the tool without silently accepting another MCP method.
+pub fn evolution_request(raw: &str) -> Option<(String, serde_json::Value)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if !matches!(name, "evolution_state" | "bench_get" | "bench_publish" | "bench_score") {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Some((name.to_string(), args))
+}
+
+
 pub fn society_state_request(raw: &str) -> bool {
     let Ok(msg) = serde_json::from_str::<Value>(raw) else {
         return false;
@@ -2874,7 +2939,7 @@ pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
                 msg.get("params").and_then(|p| p.get("arguments")).cloned(),
             ) {
                 Some(result) => Ok(result),
-                None => Err((-32602, format!("unknown tool: {name}"))),
+                None => Err((-32601, format!("unknown tool: {name}"))),
             },
             None => Err((-32602, "tools/call requires a tool name".to_string())),
         },
@@ -2926,6 +2991,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "get_revenue" => &ctx.revenue,
         // Rate card (§7 compute): precomputed snapshot, both paths.
         "get_rate_card" => &ctx.rate_card,
+        "evolution_state" | "bench_get" | "bench_publish" | "bench_score" => &ctx.evolution,
         // Quota renewal (auto): populated per-request (needs key_id).
         "renew_quota" => &ctx.renew_result,
         // §1 Demand tools
@@ -3213,6 +3279,7 @@ mod tests {
             demand_result: json!({}),
             renew_result: json!({}),
             rate_card: json!({}),
+            evolution: json!({}),
         }
     }
 
@@ -3345,11 +3412,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_is_invalid_params() {
+    fn unknown_tool_is_unknown_tool_error() {
         let r = call(
             r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
         );
-        assert_eq!(r["error"]["code"], -32602);
+        assert_eq!(r["error"]["code"], -32601);
+        assert_eq!(r["error"]["refusal"]["reason"], "unknown_tool");
     }
 
     #[test]

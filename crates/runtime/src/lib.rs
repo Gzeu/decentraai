@@ -17,6 +17,7 @@ pub mod chat_history;
 pub mod dashboard;
 pub mod dashboard_v2;
 pub mod economic_agent;
+pub mod evolution;
 pub mod fabric_dashboard;
 pub mod fabric_flow;
 pub mod fabric_landing;

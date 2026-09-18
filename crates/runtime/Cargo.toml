@@ -37,6 +37,7 @@ decentraai-agent-society = { path = "../agent-society" }
 decentraai-agent-personal-memory = { path = "../agent-personal-memory" }
 decentraai-economy = { path = "../economy" }
 blake3.workspace = true
+regex.workspace = true
 futures.workspace = true
 base64.workspace = true
 bech32.workspace = true
