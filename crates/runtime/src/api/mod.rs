@@ -1765,6 +1765,7 @@ async fn openapi_handler() -> Response {
             "/v1/conversations/{id}": { "x-internal": true, "get": { "operationId": "getConversation", "summary": "Load one owned conversation", "responses": { "200": { "description": "Conversation" }, "401": { "description": "Unauthorized" }, "404": { "description": "Not found" } } }, "delete": { "operationId": "deleteConversation", "summary": "Delete one owned conversation", "responses": { "200": { "description": "Delete result" }, "401": { "description": "Unauthorized" } } } },
             "/v1/completions": { "x-internal": true, "post": { "operationId": "completions", "summary": "Text completion", "responses": { "200": { "description": "Completion" } } } },
             "/status": { "x-internal": true, "get": { "operationId": "status", "summary": "Node status snapshot (dashboard)", "responses": { "200": { "description": "Status" } } } },
+            "/v1/version": { "get": { "operationId": "version", "summary": "Public build identity and running binary hash", "responses": { "200": { "description": "Build identity" } } } },
             "/v1/token": { "x-internal": true, "get": { "operationId": "tokenInfo", "summary": "Issued-token summary", "responses": { "200": { "description": "Tokens" } } } },
             "/v1/peers": { "x-internal": true, "get": { "operationId": "peers", "summary": "Tracked peers (verified/failed chunks, score)", "responses": { "200": { "description": "Peers" }, "401": { "description": "Unauthorized" } } } },
             "/v1/compute": { "x-internal": true, "get": { "operationId": "compute", "summary": "Workers/contributions (operator+)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Compute mesh" }, "403": { "description": "Client tokens forbidden (role separation)" } } } },
@@ -2060,6 +2061,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/bench/report", get(bench_report_handler))
         .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
+        .route("/v1/version", get(version_handler))
         .route("/metrics", get(metrics_handler))
         .route("/mcp", post(mcp_handler))
         .route("/v1/token", get(token_handler))
@@ -5829,6 +5831,33 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             },
         })),
         "recent_events": recent_audit_events(&state.info.repo_root),
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Public build identity endpoint. It exposes immutable build metadata and
+/// the SHA-256 of the running executable, without credentials or config.
+async fn version_handler() -> Response {
+    let (binary_sha256, binary_bytes) = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            Some((hex::encode(hasher.finalize()), bytes.len() as u64))
+        })
+        .unwrap_or_default();
+    let body = serde_json::json!({
+        "service": "decentraai-node",
+        "package_version": env!("CARGO_PKG_VERSION"),
+        "git_commit": option_env!("DECENTRAAI_GIT_COMMIT").unwrap_or("unknown"),
+        "binary_sha256": binary_sha256,
+        "binary_bytes": binary_bytes,
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
