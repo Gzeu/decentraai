@@ -349,13 +349,13 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "evolution_state",
-            description: "Read-only evolution summary: published bench count and aggregate generation/artifact state. Holdout contents are never exposed.",
+            description: "Operator-authenticated read-only evolution summary: published bench ids/hashes and aggregate generation/artifact state. The anonymous counterpart is GET /v1/evolution/state; holdout contents are never exposed.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
             annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "bench_get",
-            description: "Read a published evolution bench by id or announced bench_hash. Returns metadata and public train items; holdout targets/checks remain node-private.",
+            description: "Read metadata for a published evolution bench by id or announced bench_hash. Holdout targets/checks and all bench items remain node-private.",
             input_schema: json!({ "type": "object", "properties": {
                 "bench_id": { "type": "string", "maxLength": 128 },
                 "bench_hash": { "type": "string", "minLength": 64, "maxLength": 64 }
