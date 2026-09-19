@@ -256,8 +256,8 @@ pub fn required_scopes_for(tool_name: &str) -> &'static [&'static str] {
         "renew_quota" => &["economy"],
         // Demand signal tools — available to all authenticated users
         "announce_demand" | "list_demands" | "cancel_demand" => &[],
-        "bench_get" | "evolution_state" => &[],
-        "bench_publish" | "bench_score" => &["evolution"],
+        "evolution_state" | "bench_publish" => &[],
+        "bench_get" | "bench_score" => &["evolution"],
         // Orchestrate scope
         "orchestrate_propose" | "orchestrate_status" => &["orchestrate"],
         // Economy scope

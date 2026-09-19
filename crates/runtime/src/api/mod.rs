@@ -6650,6 +6650,44 @@ fn compute_receipt(
     })
 }
 
+/// Economic receipt for Evolution benchmark calls.  Evolution scores are
+/// metered in one micro-CU per benchmark item and use the same receipt shape
+/// as compute requests, with the quota settlement explicitly visible.
+#[allow(clippy::too_many_arguments)]
+fn evolution_receipt(
+    request_id: String,
+    account: &str,
+    billed: u64,
+    consumed: u64,
+    balance_after: u64,
+    item_count: u64,
+) -> serde_json::Value {
+    let mut receipt = compute_receipt(
+        request_id,
+        "evolution",
+        String::new(),
+        0,
+        0,
+        item_count,
+        0,
+        billed,
+        balance_after,
+        consumed,
+        Some(account),
+        false,
+        0,
+        0,
+        item_count,
+    );
+    receipt["micro_cu_consumed"] = serde_json::json!(consumed);
+    receipt["quota"] = serde_json::json!({
+        "reserved": false,
+        "settled": true,
+        "tokens_settled": consumed,
+    });
+    receipt
+}
+
 /// Best-effort onboarding label for `discover_capabilities`: the scope a
 /// tool needs, or "operator" for role-gated tools no consumer key can ever
 /// call (proven by the denial test), or "none". The AUTHORITATIVE scopes
@@ -9926,6 +9964,17 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
     resp
 }
 
+fn mcp_context_response(ctx: &crate::mcp::McpContext, raw: &str) -> Response {
+    match crate::mcp::handle_message(ctx, raw) {
+        Some(json) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&json).unwrap_or_default(),
+        )
+            .into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
 async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) -> Response {
     let Auth::Consumer {
         key_id,
@@ -9955,6 +10004,130 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             .as_secs();
     }
     let mut ctx = mcp_context(state).await;
+
+    // Evolution consumer path.  Reading a bench is scope-gated; scoring is
+    // additionally metered against the authenticated dca_ account.  The
+    // reservation and settlement intentionally happen in this single call so
+    // no benchmark can consume quota without an auditable receipt.
+    if let Some((name, args)) = crate::mcp::evolution_request(&raw) {
+        if name == "evolution_state" || name == "bench_publish" {
+            return forbidden("consumer keys cannot access operator-only Evolution control");
+        }
+        if !scopes.iter().any(|s| s == "evolution" || s == "*") {
+            return forbidden("consumer key missing evolution scope");
+        }
+        let request_id = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .unwrap_or_else(|| {
+                format!(
+                    "evolution-{}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                )
+            });
+        let mut store = state.evolution_store.lock().await;
+        match name.as_str() {
+            "bench_get" => {
+                let id = args
+                    .get("bench_id")
+                    .or_else(|| args.get("bench_hash"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                ctx.evolution = match store.get_by_id_or_hash(id) {
+                    Some(b) => serde_json::json!({
+                        "bench_id": b.bench_id, "title": b.title,
+                        "bench_hash": b.bench_hash, "created_tick": b.created_tick,
+                        "frozen": b.frozen, "item_count": b.item_count(),
+                        "train_total": b.train_count(), "hold_total": b.hold_count(),
+                    }),
+                    None => serde_json::json!({"error":"bench not found", "refusal":{"reason":"not_found", "detail":"bench not found"}}),
+                };
+            }
+            "bench_score" => {
+                let id = args
+                    .get("bench_id")
+                    .or_else(|| args.get("bench_hash"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let rows = args.get("rows").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                let artifact = args.get("artifact").cloned().unwrap_or(serde_json::Value::Null);
+                let fallback = artifact.as_str().map(str::to_string).unwrap_or_else(|| serde_json::to_string(&artifact).unwrap_or_default());
+                let artifact_hash = args.get("artifact_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let zero_receipt = |items: u64| evolution_receipt(request_id.clone(), account, 0, 0, state.quota_levels(account).0, items);
+                let Some(b) = store.get_by_id_or_hash(id).cloned() else {
+                    ctx.evolution = serde_json::json!({"error":"bench not found", "refusal":{"reason":"not_found", "detail":"bench not found"}, "receipt": zero_receipt(0)});
+                    return mcp_context_response(&ctx, &raw);
+                };
+                let item_count = b.items.len() as u64;
+                if artifact_hash.len() != 64 || !artifact_hash.chars().all(|c| c.is_ascii_hexdigit()) || !artifact.is_object() {
+                    let detail = "artifact_hash must be 64 hex chars and artifact must be an object";
+                    ctx.evolution = serde_json::json!({"error": detail, "refusal":{"reason":"invalid_request", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                }
+                if crate::evolution::artifact_hash(&artifact) != artifact_hash {
+                    let detail = "artifact_hash does not match artifact";
+                    ctx.evolution = serde_json::json!({"error": detail, "refusal":{"reason":"conflict", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                let lease_seconds = args.get("lease_seconds").and_then(|v| v.as_u64()).unwrap_or(300);
+                let max_micro_cu_per_run = args.get("max_micro_cu_per_run").and_then(|v| v.as_u64()).unwrap_or(item_count);
+                let lease_id = args.get("lease_id").and_then(|v| v.as_str());
+                let lease = match store.use_score_lease(&b.bench_id, &artifact_hash, lease_id, lease_seconds, max_micro_cu_per_run, item_count, now) {
+                    Ok(lease) => lease,
+                    Err(detail) => {
+                        ctx.evolution = serde_json::json!({"error":detail, "refusal":{"reason":"budget_denied", "detail":detail}, "receipt": zero_receipt(item_count)});
+                        return mcp_context_response(&ctx, &raw);
+                    }
+                };
+                let (available, reserved) = state.quota_levels(account);
+                if *quota_ceiling < item_count || available < item_count {
+                    let detail = format!("no spendable quota (available {available}, reserved {reserved})");
+                    ctx.evolution = serde_json::json!({"error":detail, "refusal":{"reason":"insufficient_quota", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                }
+                let Some(ledger) = state.quota_ledger.clone() else {
+                    let detail = "no spendable quota (available 0, reserved 0)";
+                    ctx.evolution = serde_json::json!({"error":detail, "refusal":{"reason":"insufficient_quota", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                };
+                let reservation_id = format!("evolution:{key_id}:{request_id}");
+                if ledger.lock().unwrap().reserve_with_key(&account.to_string(), &reservation_id, item_count, Some(key_id.clone())).is_err() {
+                    let (available, reserved) = state.quota_levels(account);
+                    let detail = format!("no spendable quota (available {available}, reserved {reserved})");
+                    ctx.evolution = serde_json::json!({"error":detail, "refusal":{"reason":"insufficient_quota", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                }
+                let score = crate::evolution::score_bench(&b.items, &|item_id| rows.get(item_id).and_then(|v| v.as_str()).map(str::to_string), &fallback);
+                let consumed = ledger.lock().unwrap().settle(&reservation_id, item_count).unwrap_or(0);
+                let balance_after = state.quota_levels(account).0;
+                store.record_score(crate::evolution::EvolutionScoreRecord {
+                    artifact_hash: artifact_hash.clone(), bench_hash: score.bench_hash.clone(),
+                    train: score.train.clone(), hold: score.hold.clone(), score: score.score,
+                    total: score.total, accepted: score.hold.passed == score.hold.total,
+                    at: now, evidence_id: None,
+                });
+                let path = crate::evolution::benches_path_for(&state.info.repo_root);
+                store.save(&path);
+                let mut out = serde_json::to_value(score).unwrap_or_else(|_| serde_json::json!({}));
+                out["artifact_hash"] = serde_json::Value::String(artifact_hash);
+                out["lease_id"] = serde_json::Value::String(lease.lease_id);
+                out["lease_expires_at"] = serde_json::json!(lease.lease_expires_at);
+                out["lease_seconds"] = serde_json::json!(lease.lease_expires_at.saturating_sub(now));
+                out["max_micro_cu_per_run"] = serde_json::json!(lease.max_micro_cu_per_run);
+                out["micro_cu_reserved"] = serde_json::json!(lease.micro_cu_reserved);
+                out["micro_cu_consumed"] = serde_json::json!(lease.micro_cu_consumed);
+                out["receipt"] = evolution_receipt(request_id, account, item_count, consumed, balance_after, item_count);
+                out["quota"] = serde_json::json!({"reserved":false,"settled":true,"tokens_settled":consumed});
+                ctx.evolution = out;
+            }
+            _ => {}
+        }
+        return mcp_context_response(&ctx, &raw);
+    }
 
     // `decide`: read-only unified decision projection — allowed for consumers
     // so an agent can pick what to run before executing.
@@ -11327,10 +11500,10 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                             "orchestrate_propose" | "orchestrate_status" => {
                                 scopes.iter().any(|s| s == "orchestrate" || s == "*")
                             }
-                            "evolution_state" | "bench_get" => true,
-                            // Bench publication/scoring is operator/master-only
-                            // until quota-backed evolution leases are wired.
-                            "bench_publish" | "bench_score" => false,
+                            "evolution_state" | "bench_publish" => false,
+                            "bench_get" | "bench_score" => {
+                                scopes.iter().any(|s| s == "evolution" || s == "*")
+                            }
                             _ => true,
                         }
                     });
