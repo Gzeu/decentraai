@@ -21,25 +21,52 @@
 > 📘 **Product documentation:** [`docs/PRODUCT.md`](docs/PRODUCT.md)
 > 📋 **Current integration task:** [Issue #78 — ChatGPT MCP App: HTTPS + OAuth + Agent World integration](https://github.com/Gzeu/decentraai/issues/78)
 
-## ✅ Latest verified deployment
+## ✅ Factory status (latest verified deployment)
 
-The Evolution billing and lease persistence path is live on the VPS node. The
-current backend branch is `feature/evolution-backend-a-h` at commit
-`1a0dc951fa60a66c0a69f8bdbf57b05d257a08ba`.
+DecentraAI is running as a VPS-coordinated fabric: the node exposes the public
+MCP/API surface, serves a local inference worker, persists quota/evidence and
+connects to the peer mesh. The backend implementation is versioned on
+`feature/evolution-backend-a-h` at
+`1a0dc951fa60a66c0a69f8bdbf57b05d257a08ba`; the README status update is merged
+on `main`.
+
+### Live public surfaces
+
+- Console: [`https://decentraai.duckdns.org/console/`](https://decentraai.duckdns.org/console/) (v1.71.1)
+- MCP: `https://decentraai.duckdns.org/mcp`
+- Build identity: `GET https://decentraai.duckdns.org/v1/version`
+- Evolution projection: `GET https://decentraai.duckdns.org/v1/evolution/state`
+- Agent World: `/world`; dashboards: `/arena`, `/hub`, `/flow`, `/fabric`
+
+### Verified Evolution/economics path
 
 - `bench_score` bills the authenticated `dca_` account through
-  `reserve_with_key` → `settle`, with a complete quota receipt.
-- Evolution leases persist across node restarts; expiry and cumulative budget
-  refusals are fail-closed and do not debit the ledger.
-- Public build identity: `GET https://decentraai.duckdns.org/v1/version`.
-- The operator console is deployed separately at
-  [`https://decentraai.duckdns.org/console/`](https://decentraai.duckdns.org/console/).
-  Console exports are deployment artifacts; backend source remains the
-  versioned project in this repository.
+  `reserve_with_key` → `settle`; receipts include billed/consumed µCU,
+  account, quota settlement, rate-card version and estimate basis.
+- Artifact substitution is rejected by recomputing `artifact_hash` from the
+  submitted artifact before aggregation.
+- Lease records persist across node restarts. Expired, unknown and cumulative
+  budget refusals are typed and do not debit the ledger.
+- The node currently reports `bench_count: 2`, `generations: 28`,
+  `distinct_artifacts: 4`, `accepted: 0`; `generations` is a node-global
+  counter across benches and consumers.
+- `*` is an intentional scope wildcard. Least-privilege consumer keys should
+  use explicit scopes such as `evolution` instead.
 
-Consumer scope matching intentionally treats `*` as a wildcard. For
-least-privilege keys, issue explicit scopes such as `evolution` instead of
-`*`.
+### Verified build
+
+`/v1/version` currently reports package `1.0.0`, binary size `54738616` bytes,
+and SHA-256
+`5dbdd808d5c9abb801c0bc8348d3087141e6121df72d220a85ebf0ebb6feb724`.
+The console export is a deployment artifact; backend source remains in this
+repository.
+
+### Open, intentionally unclaimed items
+
+`insufficient_quota` has fail-closed implementation but has not been forced on
+the live account; the remaining roadmap evidence items are G/H, richer
+evidence/anchor aggregation, and the client-side Evolution loop that drives
+`bench_score` as fitness. These are not represented as complete here.
 
 ---
 
