@@ -453,6 +453,8 @@ pub struct ApiState {
     pub arena: Arc<tokio::sync::Mutex<decentraai_arena::ArenaWorld>>,
     pub hub: Arc<tokio::sync::Mutex<decentraai_agent_hub::HubState>>,
     pub society: Arc<tokio::sync::Mutex<decentraai_agent_society::SocietyState>>,
+    /// Evolution bench store — node-owned holdout for the Evolution tab.
+    pub evolution_store: Arc<tokio::sync::Mutex<crate::evolution::BenchStore>>,
     /// Agent World — projection over Hub/Society/EventBus (v1). Always present.
     pub world: Arc<tokio::sync::Mutex<crate::world::WorldState>>,
     /// Wallet identity / session store (MultiversX-backed login).
@@ -570,6 +572,10 @@ impl ApiState {
             society: Arc::new(tokio::sync::Mutex::new(
                 decentraai_agent_society::SocietyState::with_tick(0),
             )),
+            evolution_store: {
+                let p = crate::evolution::benches_path_for(&info.repo_root);
+                Arc::new(tokio::sync::Mutex::new(crate::evolution::BenchStore::load(&p)))
+            },
             world: {
                 let p = crate::world::world_path_for(&info.repo_root);
                 let ws = crate::world::load_world_state(&p);
@@ -1275,6 +1281,26 @@ impl ApiState {
         }
     }
 
+    /// Evolution control is an operator capability, not a master-token-only
+    /// browser privilege. A subscriber carrying the operator role may publish
+    /// and score benches; the master remains accepted for node administration.
+    pub(crate) fn require_evolution_operator(&self, headers: &HeaderMap) -> Result<(), GateError> {
+        match self.classify(headers) {
+            Ok(Auth::Master) | Ok(Auth::Open) => Ok(()),
+            Ok(Auth::Subscriber { role, .. }) if role == decentraai_tokens::Role::Operator => Ok(()),
+            Ok(Auth::Subscriber { name, .. }) => Err(GateError::Forbidden(format!(
+                "'{name}' is a client token; evolution tools need an operator or master token"
+            ))),
+            Ok(Auth::Consumer { key_id, .. }) => Err(GateError::Forbidden(format!(
+                "'{key_id}' is a consumer API key; evolution tools need an operator token with evolution scope"
+            ))),
+            Ok(Auth::Wallet { wallet_address, .. }) => Err(GateError::Forbidden(format!(
+                "'{wallet_address}' is a wallet session; evolution tools need an operator token"
+            ))),
+            Err(_) => Err(GateError::Unauthorized),
+        }
+    }
+
     /// Role separation (H4): the operational read views (status, workers,
     /// network, execution, peers) are allowed for the master (admin), open
     /// mode (single-user), or an `operator`-role subscription token. A plain
@@ -1739,6 +1765,7 @@ async fn openapi_handler() -> Response {
             "/v1/conversations/{id}": { "x-internal": true, "get": { "operationId": "getConversation", "summary": "Load one owned conversation", "responses": { "200": { "description": "Conversation" }, "401": { "description": "Unauthorized" }, "404": { "description": "Not found" } } }, "delete": { "operationId": "deleteConversation", "summary": "Delete one owned conversation", "responses": { "200": { "description": "Delete result" }, "401": { "description": "Unauthorized" } } } },
             "/v1/completions": { "x-internal": true, "post": { "operationId": "completions", "summary": "Text completion", "responses": { "200": { "description": "Completion" } } } },
             "/status": { "x-internal": true, "get": { "operationId": "status", "summary": "Node status snapshot (dashboard)", "responses": { "200": { "description": "Status" } } } },
+            "/v1/version": { "get": { "operationId": "version", "summary": "Public build identity and running binary hash", "responses": { "200": { "description": "Build identity" } } } },
             "/v1/token": { "x-internal": true, "get": { "operationId": "tokenInfo", "summary": "Issued-token summary", "responses": { "200": { "description": "Tokens" } } } },
             "/v1/peers": { "x-internal": true, "get": { "operationId": "peers", "summary": "Tracked peers (verified/failed chunks, score)", "responses": { "200": { "description": "Peers" }, "401": { "description": "Unauthorized" } } } },
             "/v1/compute": { "x-internal": true, "get": { "operationId": "compute", "summary": "Workers/contributions (operator+)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Compute mesh" }, "403": { "description": "Client tokens forbidden (role separation)" } } } },
@@ -1906,6 +1933,45 @@ async fn refusal_middleware(
     resp
 }
 
+/// Public, read-only evolution projection. Bench contents (especially holdout
+/// targets and checks) are deliberately omitted; only aggregate metadata is
+/// exposed so a third party can verify that the node owns a frozen bench.
+async fn evolution_state_handler(
+    State(state): State<ApiState>,
+    _headers: HeaderMap,
+) -> Response {
+    let store = state.evolution_store.lock().await;
+    let mut benches = Vec::with_capacity(store.benches.len());
+    for bench in store.benches.values() {
+        benches.push(serde_json::json!({
+            "bench_id": bench.bench_id,
+            "title": bench.title,
+            "bench_hash": bench.bench_hash,
+            "created_tick": bench.created_tick,
+            "frozen": bench.frozen,
+            "item_count": bench.item_count(),
+            "train_total": bench.train_count(),
+            "hold_total": bench.hold_count(),
+        }));
+    }
+    let bench_hashes: Vec<String> = store.benches.values().map(|b| b.bench_hash.clone()).collect();
+    let body = serde_json::json!({
+        "bench_count": benches.len(),
+        "benches": benches,
+        "generations": store.scores.len(),
+        "distinct_artifacts": store.scores.iter().map(|s| s.artifact_hash.as_str()).collect::<std::collections::BTreeSet<_>>().len(),
+        "accepted": store.scores.iter().filter(|s| s.accepted).count(),
+        "bench_hashes": bench_hashes,
+        "best": store.scores.iter().max_by_key(|s| (s.score, s.hold.passed)).map(|s| serde_json::json!({
+            "artifact_hash": s.artifact_hash, "bench_hash": s.bench_hash,
+            "train_passed": s.train.passed, "train_total": s.train.total,
+            "hold_passed": s.hold.passed, "hold_total": s.hold.total,
+            "score": s.score, "total": s.total, "evidence_id": s.evidence_id,
+        })),
+    });
+    ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
 pub fn build_router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(root_dashboard_handler))
@@ -1915,6 +1981,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/flow", get(fabric_flow_handler))
         .route("/arena", get(arena_dashboard_handler))
         .route("/v1/arena/state", get(crate::arena::arena_state_handler))
+        .route("/v1/evolution/state", get(evolution_state_handler))
         .route("/v1/arena/join", post(crate::arena::arena_join_handler))
         .route("/v1/arena/action", post(crate::arena::arena_action_handler))
         .route("/v1/arena/events", get(crate::arena::arena_events_handler))
@@ -1994,6 +2061,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/bench/report", get(bench_report_handler))
         .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
+        .route("/v1/version", get(version_handler))
         .route("/metrics", get(metrics_handler))
         .route("/mcp", post(mcp_handler))
         .route("/v1/token", get(token_handler))
@@ -5771,6 +5839,33 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         .into_response()
 }
 
+/// Public build identity endpoint. It exposes immutable build metadata and
+/// the SHA-256 of the running executable, without credentials or config.
+async fn version_handler() -> Response {
+    let (binary_sha256, binary_bytes) = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            Some((hex::encode(hasher.finalize()), bytes.len() as u64))
+        })
+        .unwrap_or_default();
+    let body = serde_json::json!({
+        "service": "decentraai-node",
+        "package_version": env!("CARGO_PKG_VERSION"),
+        "git_commit": option_env!("DECENTRAAI_GIT_COMMIT").unwrap_or("unknown"),
+        "binary_sha256": binary_sha256,
+        "binary_bytes": binary_bytes,
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Prometheus text-format `/metrics` endpoint: the node's real counters and
 /// gauges, exposed for local scraping. Auth-neutral (mirrors `/status`): it
 /// carries no secrets and reveals no prompts/outputs, so it is served open.
@@ -6584,6 +6679,44 @@ fn compute_receipt(
     })
 }
 
+/// Economic receipt for Evolution benchmark calls.  Evolution scores are
+/// metered in one micro-CU per benchmark item and use the same receipt shape
+/// as compute requests, with the quota settlement explicitly visible.
+#[allow(clippy::too_many_arguments)]
+fn evolution_receipt(
+    request_id: String,
+    account: &str,
+    billed: u64,
+    consumed: u64,
+    balance_after: u64,
+    item_count: u64,
+) -> serde_json::Value {
+    let mut receipt = compute_receipt(
+        request_id,
+        "evolution",
+        String::new(),
+        0,
+        0,
+        item_count,
+        0,
+        billed,
+        balance_after,
+        consumed,
+        Some(account),
+        false,
+        0,
+        0,
+        item_count,
+    );
+    receipt["micro_cu_consumed"] = serde_json::json!(consumed);
+    receipt["quota"] = serde_json::json!({
+        "reserved": false,
+        "settled": true,
+        "tokens_settled": consumed,
+    });
+    receipt
+}
+
 /// Best-effort onboarding label for `discover_capabilities`: the scope a
 /// tool needs, or "operator" for role-gated tools no consumer key can ever
 /// call (proven by the denial test), or "none". The AUTHORITATIVE scopes
@@ -6753,6 +6886,189 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
             .into_response();
     }
     let mut ctx = mcp_context(&state).await;
+    // Evolution backend (B+D): the node owns immutable benches and keeps the
+    // holdout private. All projections below are metadata or id+passed only.
+    if let Some((name, args)) = crate::mcp::evolution_request(&raw) {
+        if matches!(name.as_str(), "bench_publish" | "bench_score") {
+            if let Err(e) = state.require_evolution_operator(&headers) {
+                return e.into_response();
+            }
+        }
+        let mut store = state.evolution_store.lock().await;
+        match name.as_str() {
+            "evolution_state" => {
+                let benches: Vec<serde_json::Value> = store
+                    .benches
+                    .values()
+                    .map(|b| serde_json::json!({
+                        "bench_id": b.bench_id,
+                        "title": b.title,
+                        "bench_hash": b.bench_hash,
+                        "created_tick": b.created_tick,
+                        "frozen": b.frozen,
+                        "train_total": b.train_count(),
+                        "hold_total": b.hold_count(),
+                    }))
+                    .collect();
+                ctx.evolution = serde_json::json!({
+                    "bench_count": benches.len(),
+                    "benches": benches,
+                    "generations": store.scores.len(),
+                    "distinct_artifacts": store.scores.iter().map(|s| s.artifact_hash.as_str()).collect::<std::collections::BTreeSet<_>>().len(),
+                    "accepted": store.scores.iter().filter(|s| s.accepted).count(),
+                    "bench_hashes": store.benches.values().map(|b| b.bench_hash.clone()).collect::<Vec<_>>(),
+                    "best": store.scores.iter().max_by_key(|s| (s.score, s.hold.passed)).map(|s| serde_json::json!({
+                        "artifact_hash": s.artifact_hash, "bench_hash": s.bench_hash,
+                        "train_passed": s.train.passed, "train_total": s.train.total,
+                        "hold_passed": s.hold.passed, "hold_total": s.hold.total,
+                        "score": s.score, "total": s.total, "evidence_id": s.evidence_id,
+                    })),
+                });
+            }
+            "bench_get" => {
+                let id = args.get("bench_id").or_else(|| args.get("bench_hash")).and_then(|v| v.as_str()).unwrap_or("");
+                ctx.evolution = match store.get_by_id_or_hash(id) {
+                    Some(b) => {
+                        serde_json::json!({
+                            "bench_id": b.bench_id, "title": b.title,
+                            "bench_hash": b.bench_hash, "created_tick": b.created_tick,
+                            "frozen": b.frozen, "item_count": b.item_count(),
+                            "train_total": b.train_count(), "hold_total": b.hold_count(),
+                        })
+                    }
+                    None => serde_json::json!({"error": "bench not found", "refusal": {"reason": "not_found", "detail": "bench not found"}}),
+                };
+            }
+            "bench_publish" => {
+                let id = args.get("bench_id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let raw_items = args.get("items").cloned().unwrap_or(serde_json::Value::Null);
+                let parsed: Result<Vec<crate::evolution::BenchItemPersist>, _> = serde_json::from_value(raw_items);
+                if id.is_empty() || id.len() > 128 {
+                    ctx.evolution = serde_json::json!({"error": "bench_id must be 1..128 characters"});
+                } else if store.get(id).is_some() {
+                    ctx.evolution = serde_json::json!({"error": "bench already exists"});
+                } else {
+                    match parsed {
+                        Ok(items) if !items.is_empty() && items.len() <= 10_000 => {
+                            match crate::evolution::validate_bench_items(&items) {
+                                Ok(()) => {
+                                    let b = store.publish(id, title, items, 0);
+                                    let path = crate::evolution::benches_path_for(&state.info.repo_root);
+                                    store.save(&path);
+                                    ctx.evolution = serde_json::json!({
+                                        "bench_id": b.bench_id, "title": b.title,
+                                        "bench_hash": b.bench_hash, "created_tick": b.created_tick,
+                                        "frozen": b.frozen, "item_count": b.item_count(),
+                                        "train_total": b.train_count(),
+                                        "hold_total": b.hold_count(),
+                                    });
+                                }
+                                Err(e) => ctx.evolution = serde_json::json!({"error": e}),
+                            }
+                        }
+                        Ok(_) => ctx.evolution = serde_json::json!({"error": "items must contain 1..10000 entries"}),
+                        Err(e) => ctx.evolution = serde_json::json!({"error": format!("invalid bench items: {e}")}),
+                    }
+                }
+            }
+            "bench_score" => {
+                let id = args.get("bench_id").or_else(|| args.get("bench_hash")).and_then(|v| v.as_str()).unwrap_or("");
+                let rows = args.get("rows").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                let artifact = args.get("artifact").cloned().unwrap_or(serde_json::Value::Null);
+                let fallback = artifact.as_str().map(str::to_string).unwrap_or_else(|| {
+                    serde_json::to_string(&artifact).unwrap_or_default()
+                });
+                ctx.evolution = match store.get_by_id_or_hash(id).cloned() {
+                    Some(b) => {
+                        let artifact_hash = args
+                            .get("artifact_hash")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if artifact_hash.len() != 64
+                            || !artifact_hash.chars().all(|c| c.is_ascii_hexdigit())
+                            || !artifact.is_object()
+                        {
+                            let body = mcp_error_envelope(
+                                &raw,
+                                -32602,
+                                "invalid_request",
+                                "artifact_hash must be 64 hex chars and artifact must be an object",
+                            );
+                            return (
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                body.to_string(),
+                            )
+                                .into_response();
+                        }
+                        let calculated_hash = crate::evolution::artifact_hash(&artifact);
+                        if calculated_hash != artifact_hash {
+                            let body = mcp_error_envelope(
+                                &raw,
+                                -32000,
+                                "conflict",
+                                "artifact_hash does not match artifact",
+                            );
+                            return (
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                body.to_string(),
+                            )
+                                .into_response();
+                        }
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let lease_seconds = args.get("lease_seconds").and_then(|v| v.as_u64()).unwrap_or(300);
+                        let cost = b.items.len() as u64;
+                        let max_micro_cu_per_run = args.get("max_micro_cu_per_run").and_then(|v| v.as_u64()).unwrap_or(cost);
+                        let lease_id = args.get("lease_id").and_then(|v| v.as_str());
+                        let lease = match store.use_score_lease(&b.bench_id, &artifact_hash, lease_id, lease_seconds, max_micro_cu_per_run, cost, now) {
+                            Ok(lease) => lease,
+                            Err(e) => {
+                                let body = mcp_error_envelope(&raw, -32000, "budget_denied", e);
+                                return ([(axum::http::header::CONTENT_TYPE, "application/json")], body.to_string()).into_response();
+                            }
+                        };
+                        let score = crate::evolution::score_bench(
+                            &b.items,
+                            &|item_id| rows.get(item_id).and_then(|v| v.as_str()).map(str::to_string),
+                            &fallback,
+                        );
+                        if !artifact_hash.is_empty() {
+                            store.record_score(crate::evolution::EvolutionScoreRecord {
+                                artifact_hash: artifact_hash.clone(),
+                                bench_hash: score.bench_hash.clone(),
+                                train: score.train.clone(),
+                                hold: score.hold.clone(),
+                                score: score.score,
+                                total: score.total,
+                                accepted: score.hold.passed == score.hold.total,
+                                at: now,
+                                evidence_id: None,
+                            });
+                            let path = crate::evolution::benches_path_for(&state.info.repo_root);
+                            store.save(&path);
+                        }
+                        let mut out = serde_json::to_value(score).unwrap_or_else(|_| serde_json::json!({}));
+                        if !artifact_hash.is_empty() {
+                            out["artifact_hash"] = serde_json::Value::String(artifact_hash);
+                        }
+                        out["lease_id"] = serde_json::Value::String(lease.lease_id);
+                        out["lease_expires_at"] = serde_json::json!(lease.lease_expires_at);
+                        out["lease_seconds"] = serde_json::json!(lease.lease_expires_at.saturating_sub(now));
+                        out["max_micro_cu_per_run"] = serde_json::json!(lease.max_micro_cu_per_run);
+                        out["micro_cu_reserved"] = serde_json::json!(lease.micro_cu_reserved);
+                        out["micro_cu_consumed"] = serde_json::json!(lease.micro_cu_consumed);
+                        out
+                    }
+                    None => serde_json::json!({"error": "bench not found", "refusal": {"reason": "not_found", "detail": "bench not found"}}),
+                };
+            }
+            _ => {}
+        }
+    }
     // A `search_models_by_capability` call needs a live Hub lookup: precompute
     // its result here (the MCP layer is I/O-free). Unknown/invalid capability
     // values yield an empty honest result, never a fabricated positive.
@@ -7571,6 +7887,20 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 }
             },
         };
+        // Request A: optional evolution anchor (artifact/parent/bench hashes),
+        // validated fail-fast exactly like deliverable_hash.
+        let evolution = match crate::hub::evolution_tag_from_value(&args) {
+            Ok(tag) => tag,
+            Err(name) => {
+                ctx.hub_action =
+                    serde_json::json!({"error": format!("{name} must be 64 hex chars")});
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&ctx.hub_action).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+        };
         // sybil: refusing to award the issuer their own bid happens BEFORE
         // anything mutates (no execution, no credit, no events). The no-bid
         // issuer fallback below is untouched (no bid exists there).
@@ -7617,12 +7947,13 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
         }
         // Receipt-grade record (same as the REST path — no divergence).
         let _settle_tick = hub.tick;
-        hub.record_settlement(
+        hub.record_settlement_with_evolution(
             &task_id,
             evidence_id.clone(),
             executor.to_string(),
             _settle_tick,
             deliverable.clone(),
+            evolution.clone(),
         );
         hub.advance_tick();
         let hub_path = crate::hub::hub_path_for(&state.info.repo_root);
@@ -7849,7 +8180,10 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
         // block above (line ~6564). This second duplicate block was causing a
         // deadlock by acquiring StdMutex<TrustStore> inside the tokio context
         // without spawn_blocking. Removed to fix the deadlock.
-        let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        let mut res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        if let Some(evo) = &evolution {
+            res["evolution"] = serde_json::to_value(evo).unwrap_or(serde_json::json!({}));
+        }
         ctx.hub_action = res;
     }
     // Society MCP handlers (M2 Society)
@@ -9659,6 +9993,17 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
     resp
 }
 
+fn mcp_context_response(ctx: &crate::mcp::McpContext, raw: &str) -> Response {
+    match crate::mcp::handle_message(ctx, raw) {
+        Some(json) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&json).unwrap_or_default(),
+        )
+            .into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
 async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) -> Response {
     let Auth::Consumer {
         key_id,
@@ -9688,6 +10033,130 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
             .as_secs();
     }
     let mut ctx = mcp_context(state).await;
+
+    // Evolution consumer path.  Reading a bench is scope-gated; scoring is
+    // additionally metered against the authenticated dca_ account.  The
+    // reservation and settlement intentionally happen in this single call so
+    // no benchmark can consume quota without an auditable receipt.
+    if let Some((name, args)) = crate::mcp::evolution_request(&raw) {
+        if name == "evolution_state" || name == "bench_publish" {
+            return forbidden("consumer keys cannot access operator-only Evolution control");
+        }
+        if !scopes.iter().any(|s| s == "evolution" || s == "*") {
+            return forbidden("consumer key missing evolution scope");
+        }
+        let request_id = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .unwrap_or_else(|| {
+                format!(
+                    "evolution-{}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                )
+            });
+        let mut store = state.evolution_store.lock().await;
+        match name.as_str() {
+            "bench_get" => {
+                let id = args
+                    .get("bench_id")
+                    .or_else(|| args.get("bench_hash"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                ctx.evolution = match store.get_by_id_or_hash(id) {
+                    Some(b) => serde_json::json!({
+                        "bench_id": b.bench_id, "title": b.title,
+                        "bench_hash": b.bench_hash, "created_tick": b.created_tick,
+                        "frozen": b.frozen, "item_count": b.item_count(),
+                        "train_total": b.train_count(), "hold_total": b.hold_count(),
+                    }),
+                    None => serde_json::json!({"error":"bench not found", "refusal":{"reason":"not_found", "detail":"bench not found"}}),
+                };
+            }
+            "bench_score" => {
+                let id = args
+                    .get("bench_id")
+                    .or_else(|| args.get("bench_hash"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let rows = args.get("rows").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                let artifact = args.get("artifact").cloned().unwrap_or(serde_json::Value::Null);
+                let fallback = artifact.as_str().map(str::to_string).unwrap_or_else(|| serde_json::to_string(&artifact).unwrap_or_default());
+                let artifact_hash = args.get("artifact_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let zero_receipt = |items: u64| evolution_receipt(request_id.clone(), account, 0, 0, state.quota_levels(account).0, items);
+                let Some(b) = store.get_by_id_or_hash(id).cloned() else {
+                    ctx.evolution = serde_json::json!({"error":"bench not found", "refusal":{"reason":"not_found", "detail":"bench not found"}, "receipt": zero_receipt(0)});
+                    return mcp_context_response(&ctx, &raw);
+                };
+                let item_count = b.items.len() as u64;
+                if artifact_hash.len() != 64 || !artifact_hash.chars().all(|c| c.is_ascii_hexdigit()) || !artifact.is_object() {
+                    let detail = "artifact_hash must be 64 hex chars and artifact must be an object";
+                    ctx.evolution = serde_json::json!({"error": detail, "refusal":{"reason":"invalid_request", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                }
+                if crate::evolution::artifact_hash(&artifact) != artifact_hash {
+                    let detail = "artifact_hash does not match artifact";
+                    ctx.evolution = serde_json::json!({"error": detail, "refusal":{"reason":"conflict", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                let lease_seconds = args.get("lease_seconds").and_then(|v| v.as_u64()).unwrap_or(300);
+                let max_micro_cu_per_run = args.get("max_micro_cu_per_run").and_then(|v| v.as_u64()).unwrap_or(item_count);
+                let lease_id = args.get("lease_id").and_then(|v| v.as_str());
+                let lease = match store.use_score_lease(&b.bench_id, &artifact_hash, lease_id, lease_seconds, max_micro_cu_per_run, item_count, now) {
+                    Ok(lease) => lease,
+                    Err(detail) => {
+                        ctx.evolution = serde_json::json!({"error":detail, "refusal":{"reason":"budget_denied", "detail":detail}, "receipt": zero_receipt(item_count)});
+                        return mcp_context_response(&ctx, &raw);
+                    }
+                };
+                let (available, reserved) = state.quota_levels(account);
+                if *quota_ceiling < item_count || available < item_count {
+                    let detail = format!("no spendable quota (available {available}, reserved {reserved})");
+                    ctx.evolution = serde_json::json!({"error":detail, "refusal":{"reason":"insufficient_quota", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                }
+                let Some(ledger) = state.quota_ledger.clone() else {
+                    let detail = "no spendable quota (available 0, reserved 0)";
+                    ctx.evolution = serde_json::json!({"error":detail, "refusal":{"reason":"insufficient_quota", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                };
+                let reservation_id = format!("evolution:{key_id}:{request_id}");
+                if ledger.lock().unwrap().reserve_with_key(&account.to_string(), &reservation_id, item_count, Some(key_id.clone())).is_err() {
+                    let (available, reserved) = state.quota_levels(account);
+                    let detail = format!("no spendable quota (available {available}, reserved {reserved})");
+                    ctx.evolution = serde_json::json!({"error":detail, "refusal":{"reason":"insufficient_quota", "detail":detail}, "receipt": zero_receipt(item_count)});
+                    return mcp_context_response(&ctx, &raw);
+                }
+                let score = crate::evolution::score_bench(&b.items, &|item_id| rows.get(item_id).and_then(|v| v.as_str()).map(str::to_string), &fallback);
+                let consumed = ledger.lock().unwrap().settle(&reservation_id, item_count).unwrap_or(0);
+                let balance_after = state.quota_levels(account).0;
+                store.record_score(crate::evolution::EvolutionScoreRecord {
+                    artifact_hash: artifact_hash.clone(), bench_hash: score.bench_hash.clone(),
+                    train: score.train.clone(), hold: score.hold.clone(), score: score.score,
+                    total: score.total, accepted: score.hold.passed == score.hold.total,
+                    at: now, evidence_id: None,
+                });
+                let path = crate::evolution::benches_path_for(&state.info.repo_root);
+                store.save(&path);
+                let mut out = serde_json::to_value(score).unwrap_or_else(|_| serde_json::json!({}));
+                out["artifact_hash"] = serde_json::Value::String(artifact_hash);
+                out["lease_id"] = serde_json::Value::String(lease.lease_id);
+                out["lease_expires_at"] = serde_json::json!(lease.lease_expires_at);
+                out["lease_seconds"] = serde_json::json!(lease.lease_expires_at.saturating_sub(now));
+                out["max_micro_cu_per_run"] = serde_json::json!(lease.max_micro_cu_per_run);
+                out["micro_cu_reserved"] = serde_json::json!(lease.micro_cu_reserved);
+                out["micro_cu_consumed"] = serde_json::json!(lease.micro_cu_consumed);
+                out["receipt"] = evolution_receipt(request_id, account, item_count, consumed, balance_after, item_count);
+                out["quota"] = serde_json::json!({"reserved":false,"settled":true,"tokens_settled":consumed});
+                ctx.evolution = out;
+            }
+            _ => {}
+        }
+        return mcp_context_response(&ctx, &raw);
+    }
 
     // `decide`: read-only unified decision projection — allowed for consumers
     // so an agent can pick what to run before executing.
@@ -10682,6 +11151,19 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 }
             },
         };
+        // Request A: optional evolution anchor, fail-fast validated like
+        // deliverable_hash.
+        let evolution = match crate::hub::evolution_tag_from_value(&args) {
+            Ok(tag) => tag,
+            Err(name) => {
+                let body = mcp_error_envelope(&raw, -32602, "invalid_request", &format!("{name} must be 64 hex chars"));
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&body).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+        };
         // sybil: refusing to award the issuer their own bid happens BEFORE
         // anything mutates. The no-bid issuer fallback below is untouched.
         // (This branch answers in the path's own JSON-RPC error envelope,
@@ -10724,12 +11206,13 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
         }
         // Receipt-grade record (same as the REST path — no divergence).
         let _settle_tick = hub.tick;
-        hub.record_settlement(
+        hub.record_settlement_with_evolution(
             &task_id,
             evidence_id.clone(),
             account.clone(),
             _settle_tick,
             deliverable.clone(),
+            evolution.clone(),
         );
         hub.advance_tick();
         let hub_path = crate::hub::hub_path_for(&state.info.repo_root);
@@ -10949,7 +11432,10 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 }
             }
         }
-        let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        let mut res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        if let Some(evo) = &evolution {
+            res["evolution"] = serde_json::to_value(evo).unwrap_or(serde_json::json!({}));
+        }
         let id = serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.get("id").cloned())
@@ -11042,6 +11528,10 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                             }
                             "orchestrate_propose" | "orchestrate_status" => {
                                 scopes.iter().any(|s| s == "orchestrate" || s == "*")
+                            }
+                            "evolution_state" | "bench_publish" => false,
+                            "bench_get" | "bench_score" => {
+                                scopes.iter().any(|s| s == "evolution" || s == "*")
                             }
                             _ => true,
                         }
@@ -12660,6 +13150,14 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
                 "ocr_per_page": card.ocr_per_page,
             })
         },
+        evolution: serde_json::json!({
+            "tag": crate::evolution::EVOLUTION_TAG,
+            "bench_count": 0,
+            "generations": 0,
+            "distinct_artifacts": 0,
+            "best": serde_json::Value::Null,
+            "benches": [],
+        }),
     }
 }
 
