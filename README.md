@@ -21,6 +21,26 @@
 > 📘 **Product documentation:** [`docs/PRODUCT.md`](docs/PRODUCT.md)
 > 📋 **Current integration task:** [Issue #78 — ChatGPT MCP App: HTTPS + OAuth + Agent World integration](https://github.com/Gzeu/decentraai/issues/78)
 
+## ✅ Latest verified deployment
+
+The Evolution billing and lease persistence path is live on the VPS node. The
+current backend branch is `feature/evolution-backend-a-h` at commit
+`1a0dc951fa60a66c0a69f8bdbf57b05d257a08ba`.
+
+- `bench_score` bills the authenticated `dca_` account through
+  `reserve_with_key` → `settle`, with a complete quota receipt.
+- Evolution leases persist across node restarts; expiry and cumulative budget
+  refusals are fail-closed and do not debit the ledger.
+- Public build identity: `GET https://decentraai.duckdns.org/v1/version`.
+- The operator console is deployed separately at
+  [`https://decentraai.duckdns.org/console/`](https://decentraai.duckdns.org/console/).
+  Console exports are deployment artifacts; backend source remains the
+  versioned project in this repository.
+
+Consumer scope matching intentionally treats `*` as a wildcard. For
+least-privilege keys, issue explicit scopes such as `evolution` instead of
+`*`.
+
 ---
 
 ## 🌍 Agent World
